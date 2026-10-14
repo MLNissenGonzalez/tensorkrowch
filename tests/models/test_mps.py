@@ -1682,19 +1682,22 @@ class TestMPS:  # MARK: TestMPS
         assert torch.isin(samples, domain).all()
 
     def test_sample_keeps_mps_usable(self):
+        # sample keeps its nodes; forward removes them first.
         mps = tk.models.MPS(n_sites=3,
                             phys_dim=2,
                             bond_dim=2,
                             boundary='obc')
-
-        _ = mps.sample(n_samples=4)
-        assert not mps.resultant_nodes
-        assert not mps.data_nodes
-
         data = tk.embeddings.basis(torch.randint(0, 2, (5, 3)), dim=2)\
             .to(mps.mats_env[0].dtype)
+        expected = mps(data)
+        mps.reset()
+        mps.unset_data_nodes()
+
+        _ = mps.sample(n_samples=4)
+        assert mps.resultant_nodes
         result = mps(data)
         assert result.shape == (5,)
+        assert torch.equal(result, expected)
 
     @pytest.mark.parametrize('out_position', [0, 1, 3])
     def test_condition_matches_mpslayer_fixed_output(self, out_position):
@@ -1875,6 +1878,92 @@ class TestMPS:  # MARK: TestMPS
 
         expected = torch.tensor([0.5, 1.5, 1.]) / 3
         assert torch.allclose(captured[0][0].cpu(), expected)
+
+    def _sample_draws(self, mps, fresh, calls):
+        # Each call's draws under its own seed; ``fresh`` resets before each,
+        # so every call builds its nodes, otherwise later calls reuse them.
+        out = []
+        for i, kwargs in enumerate(calls):
+            if fresh:
+                mps.reset()
+            torch.manual_seed(i)
+            out.append(mps.sample(**kwargs))
+        return out
+
+    def _sample_sweep_calls(self, mps, batches):
+        calls = []
+        for batch in batches:
+            x = torch.rand(batch, len(mps.in_features))
+            windows = (x[..., None] + 0.1 * torch.linspace(-1, 1, 7)).clamp(0, 1)
+            calls.append(dict(in_condition=tk.embeddings.unit(x),
+                              domain=list(windows.unbind(1)),
+                              embedding=tk.embeddings.unit,
+                              renormalize=True))
+        return calls
+
+    @pytest.mark.parametrize('boundary', BOUNDARY_CASES)
+    @pytest.mark.parametrize('out_features', [[], [2]])
+    def test_sample_repeated_sweeps_reuse_nodes_and_draw_as_fresh(
+            self, boundary, out_features):
+        mps = tk.models.MPS(n_sites=5,
+                            phys_dim=2,
+                            bond_dim=3,
+                            boundary=boundary,
+                            out_features=out_features)
+        calls = self._sample_sweep_calls(mps, [4, 4, 6, 2])
+        fresh = self._sample_draws(mps, True, calls)
+        mps.reset()
+
+        torch.manual_seed(0)
+        reused = [mps.sample(**calls[0])]
+        names = set(mps.nodes)
+        for i, kwargs in enumerate(calls[1:], start=1):
+            torch.manual_seed(i)
+            reused.append(mps.sample(**kwargs))
+            assert set(mps.nodes) == names  # no node built after the first call
+        for a, b in zip(fresh, reused):
+            assert torch.equal(a, b)
+
+    @pytest.mark.parametrize('boundary', BOUNDARY_CASES)
+    @pytest.mark.parametrize('canonical', AUTO_BOOL_CASES)
+    def test_sample_repeated_unconditioned_reuse_nodes_and_draw_as_fresh(
+            self, boundary, canonical):
+        mps = tk.models.MPS(n_sites=4,
+                            phys_dim=2,
+                            bond_dim=3,
+                            boundary=boundary,
+                            out_features=[1])
+        canonical = canonical and (boundary == 'obc')
+        if canonical:
+            mps.canonicalize(orth_center=0, renormalize=True)
+        kwargs = dict(n_samples=5, canonical=canonical, renormalize=True)
+        calls = [kwargs, kwargs, dict(kwargs, n_samples=3)]
+        fresh = self._sample_draws(mps, True, calls)
+        mps.reset()
+        reused = self._sample_draws(mps, False, calls)
+        for a, b in zip(fresh, reused):
+            assert torch.equal(a, b)
+
+    def test_sample_another_structure_rebuilds_without_warning(self):
+        mps = tk.models.MPS(n_sites=4, phys_dim=2, bond_dim=3, boundary='obc')
+        sweep = self._sample_sweep_calls(mps, [3])[0]
+        shared = dict(sweep, domain=torch.linspace(0, 1, 5))
+        calls = [sweep, shared, dict(n_samples=3), sweep]
+        fresh = self._sample_draws(mps, True, calls)
+        mps.reset()
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            reused = self._sample_draws(mps, False, calls)
+        for a, b in zip(fresh, reused):
+            assert torch.equal(a, b)
+
+    def test_sample_failed_call_leaves_the_mps_reset(self):
+        mps = tk.models.MPS(n_sites=3, phys_dim=2, bond_dim=2, boundary='obc')
+        _ = mps.sample(n_samples=2)
+        with pytest.raises(ValueError, match='negative'):
+            mps.sample(n_samples=2, embedding_matrices=-torch.eye(2))
+        assert not mps.resultant_nodes and not mps.data_nodes
+        assert mps.sample(n_samples=2).shape == (2, 3)
 
     def test_sample_unusable_rows_become_uniform_and_are_counted(self):
         probs = torch.tensor([[0., 0., 0.],

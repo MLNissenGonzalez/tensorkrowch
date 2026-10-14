@@ -1843,8 +1843,9 @@ class MPS(TensorNetwork):  # MARK: MPS
         """
         
         if self._resultant_nodes:
-            warnings.warn(
-                'Resultant nodes will be removed before conditioning the TN')
+            if self._sample_key is None:
+                warnings.warn(
+                    'Resultant nodes will be removed before conditioning the TN')
             self.reset()
         if self._data_nodes:
             self.unset_data_nodes()
@@ -1914,6 +1915,47 @@ class MPS(TensorNetwork):  # MARK: MPS
     ############################
     # SAMPLE: work in progress #
     ############################
+    # The structure of the nodes ``sample`` keeps in the network (None: none
+    # kept), and those of its nodes that are not results of operations.
+    _sample_key: Optional[tuple] = None
+    _sample_nodes: dict = {}
+
+    def reset(self):
+        """:meth:`~tensorkrowch.TensorNetwork.reset`, which also removes the
+        nodes kept by :meth:`sample`."""
+        super().reset()
+        if self._sample_key is not None:
+            self._sample_key = None
+            self._sample_nodes = {}
+            self.unset_data_nodes()
+
+    def forward(self, data=None, *args, **kwargs):
+        """:meth:`~tensorkrowch.TensorNetwork.forward`, after removing the nodes
+        kept by :meth:`sample` (their operations would be replayed)."""
+        if self._sample_key is not None:
+            self.reset()
+        return super().forward(data, *args, **kwargs)
+
+    def _sample_node(self,
+                     role: Text,
+                     site: int,
+                     tensor: torch.Tensor,
+                     axes_names: Sequence[Text]) -> Tuple[Node, bool]:
+        """The node ``sample`` keeps for ``role`` at ``site``, holding
+        ``tensor``, and whether it was just created (its edges still to be
+        connected). Virtual, so ``reset`` deletes it and ``add_data`` skips it."""
+        node = self._sample_nodes.get((role, site))
+        if node is not None:
+            node.tensor = tensor
+            return node, False
+        node = Node(tensor=tensor,
+                    axes_names=axes_names,
+                    name='virtual_result_sample_' + role,
+                    network=self,
+                    virtual=True)
+        self._sample_nodes[(role, site)] = node
+        return node, True
+
     def _copy_sample_mps(self) -> Tuple[List[AbstractNode],
                                         Optional[AbstractNode],
                                         Optional[AbstractNode]]:
@@ -1977,8 +2019,10 @@ class MPS(TensorNetwork):  # MARK: MPS
     def _sample_candidate(node: AbstractNode, axis_name: Text) -> Node:
         """A view of ``node`` whose physical edge is its own, open and named
         ``axis_name``. Bond edges stay shared with the environments, so the
-        view contracts with them."""
+        view contracts with them. A repeated call returns the same view."""
         candidate = node.permute(tuple(range(node.ndim)))
+        if axis_name in candidate.axes_names:
+            return candidate
         candidate.reattach_edges(axes=['input'])
         candidate.disconnect('input')
         candidate.get_axis('input').name = axis_name
@@ -2412,12 +2456,13 @@ class MPS(TensorNetwork):  # MARK: MPS
         open_axes = [axis.name for axis in ket.axes
                      if (not axis.is_batch()) and (axis.name != 'candidate')]
         bra = ket.conj()
-        bra.reattach_edges(axes=open_axes + ['candidate'])
-        bra.get_axis('candidate').name = 'candidate_copy'
-        if open_axes:
-            ket.reattach_edges(axes=open_axes)
-            for name in open_axes:
-                ket[name] ^ bra[name]
+        if 'candidate_copy' not in bra.axes_names:
+            bra.reattach_edges(axes=open_axes + ['candidate'])
+            bra.get_axis('candidate').name = 'candidate_copy'
+            if open_axes:
+                ket.reattach_edges(axes=open_axes)
+                for name in open_axes:
+                    ket[name] ^ bra[name]
         return MPS._join_layers(ket, bra)
 
     @staticmethod
@@ -2440,10 +2485,11 @@ class MPS(TensorNetwork):  # MARK: MPS
             # halves keep their bonds to the next site).
             half = half.permute(tuple(range(half.ndim)))
             bra_half = bra_half.permute(tuple(range(bra_half.ndim)))
-            for aux_half in (half, bra_half):
-                aux_half.reattach_edges(axes=['right'])
-                aux_half.disconnect('right')
-            half['right'] ^ bra_half['right']
+            if half['right'] is not bra_half['right']:
+                for aux_half in (half, bra_half):
+                    aux_half.reattach_edges(axes=['right'])
+                    aux_half.disconnect('right')
+                half['right'] ^ bra_half['right']
         elif isinstance(right_env, tuple):
             right_ket, right_bra = right_env
             if right_ket is not None:
@@ -2476,6 +2522,7 @@ class MPS(TensorNetwork):  # MARK: MPS
         return op.einsum(f'{strings[0]},{strings[1]}->{out}', ket, bra)
 
     def _sample_probabilities(self,
+                              site: int,
                               density: AbstractNode,
                               embedded: torch.Tensor,
                               per_sample: bool) -> torch.Tensor:
@@ -2483,22 +2530,16 @@ class MPS(TensorNetwork):  # MARK: MPS
         ``(rows, domain_size)``, with one row, or one per sample."""
         axes_names = ('batch', 'domain_batch', 'feature') if per_sample \
             else ('domain_batch', 'feature')
-        candidate_data = Node(tensor=embedded,
-                              axes_names=axes_names,
-                              name='sample_candidate_data',
-                              network=self,
-                              data=True)
-        copied_candidate_data = Node(tensor=embedded,
-                                     axes_names=axes_names,
-                                     name='sample_candidate_data_copy',
-                                     network=self,
-                                     data=True)
+        candidate_data, new = self._sample_node('candidate', site, embedded,
+                                                axes_names)
+        copied_candidate_data, _ = self._sample_node('candidate_copy', site,
+                                                     embedded, axes_names)
         copied_candidate_data = copied_candidate_data.conj()
-        copied_candidate_data.reattach_edges(axes=['feature'])
-
-        density.reattach_edges(axes=['candidate', 'candidate_copy'])
-        candidate_data['feature'] ^ density['candidate']
-        copied_candidate_data['feature'] ^ density['candidate_copy']
+        if new:
+            copied_candidate_data.reattach_edges(axes=['feature'])
+            density.reattach_edges(axes=['candidate', 'candidate_copy'])
+            candidate_data['feature'] ^ density['candidate']
+            copied_candidate_data['feature'] ^ density['candidate_copy']
         probs_node = (candidate_data @ density) @ copied_candidate_data
 
         domain_axis = probs_node.get_axis_num('domain_batch')
@@ -2506,6 +2547,7 @@ class MPS(TensorNetwork):  # MARK: MPS
         return probs.reshape(-1, embedded.shape[-2])
 
     def _sample_absorb(self,
+                       site: int,
                        half: AbstractNode,
                        axis_name: Text,
                        embedded: torch.Tensor,
@@ -2513,16 +2555,16 @@ class MPS(TensorNetwork):  # MARK: MPS
                        renormalize: bool) -> Node:
         """Closes a half's open physical edge with the drawn values: the next
         left environment of the ket (or, with ``conj``, of the bra)."""
-        selected_data = Node(tensor=embedded,
-                             axes_names=('batch', 'feature'),
-                             name='sample_selected_data',
-                             network=self,
-                             data=True)
+        selected_data, new = self._sample_node(
+            'selected_copy' if conj else 'selected', site, embedded,
+            ('batch', 'feature'))
         if conj:
             selected_data = selected_data.conj()
-            selected_data.reattach_edges(axes=['feature'])
-        half.reattach_edges(axes=[axis_name])
-        selected_data['feature'] ^ half[axis_name]
+        if new:
+            if conj:
+                selected_data.reattach_edges(axes=['feature'])
+            half.reattach_edges(axes=[axis_name])
+            selected_data['feature'] ^ half[axis_name]
         result = half @ selected_data
         if renormalize:
             result = self._renormalize_sample_env(result)
@@ -2561,9 +2603,12 @@ class MPS(TensorNetwork):  # MARK: MPS
         domain. The same quadrature weights are included in the categorical
         probabilities used to sample each domain point.
 
-        This method internally calls
-        :meth:`~tensorkrowch.TensorNetwork.reset`, as sampling constructs a
-        temporary double-layer tensor network and contraction environments.
+        The nodes this method builds (environments, candidates, and for
+        unconditioned sampling a bra layer) stay in the network: a later call
+        with the same structure refills them and repeats the same operations,
+        which tensorkrowch then computes from their successors without
+        building nodes. :meth:`~tensorkrowch.TensorNetwork.reset`, and
+        ``forward`` through it, removes them.
 
         Parameters
         ----------
@@ -2695,13 +2740,66 @@ class MPS(TensorNetwork):  # MARK: MPS
             build_matrices=build_matrices,
             n_samples=n_samples)
 
-        if self._resultant_nodes:
-            warnings.warn(
-                'Resultant nodes will be removed before sampling the MPS')
-            self.reset()
-        if self._data_nodes:
-            self.unset_data_nodes()
+        # The nodes of an earlier call are reused when the structure is the
+        # same; the batch and domain sizes may differ (batch edges).
+        sweep = in_condition is not None
+        key = (sweep, canonical, renormalize, tuple(self._in_features),
+               isinstance(in_condition, torch.Tensor),
+               tuple(aux_domain.ndim for aux_domain in domains))
+        build = key != self._sample_key
+        if build:
+            if self._resultant_nodes or self._sample_key is not None:
+                if self._sample_key is None:
+                    warnings.warn('Resultant nodes will be removed before '
+                                  'sampling the MPS')
+                self.reset()
+            if self._data_nodes:
+                self.unset_data_nodes()
+            self._sample_key = key
+            self._sample_nodes = {}
 
+        try:
+            samples, sample_indices, n_unusable = self._sample_sweep(
+                build=build,
+                in_condition=in_condition,
+                n_samples=n_samples,
+                domains=domains,
+                embeddings=embeddings,
+                matrices=matrices,
+                quadrature_weights=quadrature_weights,
+                canonical=canonical,
+                renormalize=renormalize,
+                generator=generator)
+        except BaseException:
+            self.reset()
+            raise
+
+        if n_unusable:
+            warnings.warn(
+                f'{n_unusable} of {samples.numel()} draws had no usable '
+                'weight (all zero or non-finite); drawn uniformly')
+
+        if return_indices:
+            return samples, sample_indices
+        return samples
+
+    def _sample_sweep(self,
+                      build: bool,
+                      in_condition,
+                      n_samples: int,
+                      domains: List[torch.Tensor],
+                      embeddings: List[torch.Tensor],
+                      matrices: List[torch.Tensor],
+                      quadrature_weights: List[torch.Tensor],
+                      canonical: bool,
+                      renormalize: bool,
+                      generator: Optional[torch.Generator]
+                      ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """The body of :meth:`sample`: ``(samples, indices, unusable draws)``.
+
+        With ``build`` the nodes are created and connected; otherwise the kept
+        ones are refilled and the same operations repeated.
+        """
         # With ``in_condition`` every variable but the one being sampled is
         # fixed (a sweep): the ket alone suffices, one vector per sample and
         # value of the open output edges, and each site's density is the ket
@@ -2711,9 +2809,10 @@ class MPS(TensorNetwork):  # MARK: MPS
         # so contracting the two layers marginalizes them.
         sweep = in_condition is not None
         if sweep:
-            super().set_data_nodes(
-                input_edges=[node['input'] for node in self.in_env],
-                num_batch_edges=1)
+            if build:
+                super().set_data_nodes(
+                    input_edges=[node['input'] for node in self.in_env],
+                    num_batch_edges=1)
             self.add_data(in_condition)
             data_nodes = [None] * self._n_sites
             for site, data_node in zip(self._in_features,
@@ -2728,10 +2827,10 @@ class MPS(TensorNetwork):  # MARK: MPS
                 right_ket=self._right_node if self._boundary == 'obc' else None,
                 renormalize=renormalize)
         else:
-            bra_nodes, bra_left, bra_right = self._copy_sample_mps()
-            bra_nodes = [node.conj() for node in bra_nodes]
-            for bra_node in bra_nodes:
-                bra_node.reattach_edges(axes=['input'])
+            if build:
+                self._sample_nodes['bra'] = self._copy_sample_mps()
+            copied_nodes, bra_left, bra_right = self._sample_nodes['bra']
+            bra_nodes = [node.conj() for node in copied_nodes]
             if self._boundary == 'obc':
                 bra_left = bra_left.conj()
                 bra_right = bra_right.conj()
@@ -2741,18 +2840,18 @@ class MPS(TensorNetwork):  # MARK: MPS
             input_idx = 0
             for site, (node, bra_node) in enumerate(zip(self._mats_env,
                                                         bra_nodes)):
+                if build:
+                    bra_node.reattach_edges(axes=['input'])
                 if site in self._in_features:
-                    matrix_node = Node(
-                        tensor=matrices[input_idx],
-                        axes_names=('input', 'input_copy'),
-                        name='virtual_result_sample_mat',
-                        network=self,
-                        virtual=True)
-                    node['input'] ^ matrix_node['input']
-                    matrix_node['input_copy'] ^ bra_node['input']
+                    matrix_node, _ = self._sample_node(
+                        'mat', site, matrices[input_idx],
+                        ('input', 'input_copy'))
+                    if build:
+                        node['input'] ^ matrix_node['input']
+                        matrix_node['input_copy'] ^ bra_node['input']
                     matrix_nodes[site] = matrix_node
                     input_idx += 1
-                else:
+                elif build:
                     node['input'] ^ bra_node['input']
 
             # Right environments: one batch-free double layer, or none when
@@ -2798,7 +2897,7 @@ class MPS(TensorNetwork):  # MARK: MPS
                                                    canonical)
                 per_sample = domains[input_idx].ndim == 2
                 probs = self._sample_probabilities(
-                    density, embeddings[input_idx], per_sample)
+                    site, density, embeddings[input_idx], per_sample)
                 if probs.shape[0] == 1 and n_samples > 1:
                     probs = probs.expand(n_samples, -1)
 
@@ -2820,12 +2919,13 @@ class MPS(TensorNetwork):  # MARK: MPS
                     selected_embedding = embeddings[input_idx][ids]
 
                 # Absorb the drawn values into the left environments.
-                left_ket = self._sample_absorb(half, 'candidate',
+                left_ket = self._sample_absorb(site, half, 'candidate',
                                                selected_embedding,
                                                conj=False,
                                                renormalize=renormalize)
                 if not sweep:
-                    left_bra = self._sample_absorb(bra_half, 'candidate_copy',
+                    left_bra = self._sample_absorb(site, bra_half,
+                                                   'candidate_copy',
                                                    selected_embedding,
                                                    conj=True,
                                                    renormalize=renormalize)
@@ -2847,18 +2947,7 @@ class MPS(TensorNetwork):  # MARK: MPS
         # Collect values in the order of ``in_features``.
         samples = torch.stack(samples, dim=1)
         sample_indices = torch.stack(sample_indices, dim=1)
-
-        self.reset()
-        self.unset_data_nodes()
-
-        if n_unusable:
-            warnings.warn(
-                f'{n_unusable} of {samples.numel()} draws had no usable '
-                'weight (all zero or non-finite); drawn uniformly')
-
-        if return_indices:
-            return samples, sample_indices
-        return samples
+        return samples, sample_indices, n_unusable
     ############################
     # SAMPLE: work in progress #
     ############################
