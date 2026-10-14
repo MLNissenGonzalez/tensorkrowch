@@ -1917,92 +1917,72 @@ class MPS(TensorNetwork):  # MARK: MPS
     def _copy_sample_mps(self) -> Tuple[List[AbstractNode],
                                         Optional[AbstractNode],
                                         Optional[AbstractNode]]:
-        """Moves a tensor-sharing virtual MPS copy to the current network."""
-        copied_mps = self.copy(share_tensors=True)
-        copied_nodes = copied_mps.mats_env[:]
-        copied_boundaries = []
+        """Builds a virtual, tensor-sharing copy of the MPS in this network,
+        connected like the MPS (the bra layer).
+
+        Copying the MPS into a new network and moving it here would rename
+        every node, which takes time quadratic in the number of sites (3 s of
+        a 6.6 s sweep at 400 sites); building the copies here avoids it.
+        """
+        nodes = list(self._mats_env)
         if self._boundary == 'obc':
-            copied_boundaries = [copied_mps.left_node,
-                                 copied_mps.right_node]
+            nodes = [self._left_node] + nodes + [self._right_node]
 
-        # Mark the copied MPS as temporary before moving the whole component.
-        for node in copied_nodes + copied_boundaries:
-            node.name = 'virtual_result_sample_copy'
-            node.change_type(virtual=True)
-        copied_nodes[0].move_to_network(self)
+        copied = []
+        for node in nodes:
+            copied_node = node.__class__(shape=node._shape,
+                                         axes_names=node.axes_names,
+                                         name='virtual_result_sample_copy',
+                                         network=self,
+                                         virtual=True)
+            copied_node.set_tensor_from(node)
+            copied.append(copied_node)
 
-        if self._boundary == 'obc':
-            copied_left = copied_boundaries[0]
-            copied_right = copied_boundaries[1]
-        else:
-            copied_left = None
-            copied_right = None
-
-        return copied_nodes, copied_left, copied_right
+        for left, right in zip(copied[:-1], copied[1:]):
+            left['right'] ^ right['left']
+        if self._boundary == 'pbc':
+            copied[-1]['right'] ^ copied[0]['left']
+            return copied, None, None
+        return copied[1:-1], copied[0], copied[-1]
 
     @staticmethod
-    def _contract_sample_site(node: AbstractNode,
+    def _renormalize_sample_env(node: AbstractNode) -> AbstractNode:
+        """Divides a sweep environment by its norm over all non-batch axes.
+
+        That is one scalar per sample, common to every candidate value, so no
+        sampling probability changes; it only keeps long chains in range.
+        """
+        axes = [axis.name for axis in node.axes if not axis.is_batch()]
+        if axes:
+            node = node.renormalize(axis=axes)
+        return node
+
+    def _contract_sample_site(self,
+                              node: AbstractNode,
                               copied_node: AbstractNode,
                               env: Optional[AbstractNode],
                               matrix_node: Optional[AbstractNode] = None,
-                              data_nodes: Optional[Tuple[AbstractNode,
-                                                         AbstractNode]] = None,
-                              from_left: bool = False,
                               renormalize: bool = False) -> Node:
-        """Absorbs one double-layer MPS site into a sweep environment."""
-        if data_nodes is not None:
-            data_node, copied_data_node = data_nodes
-            if env is None:
-                pair_node = Node(
-                    tensor=torch.ones(1,
-                                      device=data_node.device,
-                                      dtype=data_node.dtype),
-                    axes_names=('pair',),
-                    name='virtual_result_sample_pair',
-                    network=data_node.network,
-                    virtual=True)
-                copied_pair_node = Node(
-                    tensor=torch.ones(1,
-                                      device=copied_data_node.device,
-                                      dtype=copied_data_node.dtype),
-                    axes_names=('pair',),
-                    name='virtual_result_sample_pair_copy',
-                    network=data_node.network,
-                    virtual=True)
-                pair_node['pair'] ^ copied_pair_node['pair']
-                data_node = data_node % pair_node
-                copied_data_node = copied_data_node % copied_pair_node
-
-            node = data_node @ node
-            copied_node = copied_data_node @ copied_node
-
-        if env is None:
-            if matrix_node is not None:
-                result = (node @ matrix_node) @ copied_node
-            elif node.is_connected_to(copied_node):
-                result = node @ copied_node
-            else:
-                raise ValueError(
-                    'The two sample layers should be connected before '
-                    'contracting a site')
-        elif from_left:
-            result = env @ node
-            if matrix_node is not None:
-                result = result @ matrix_node
-            result = result @ copied_node
-        else:
-            result = node @ env
-            if matrix_node is not None:
-                result = result @ matrix_node
-            result = result @ copied_node
-
+        """Absorbs one double-layer (marginalized) site into a right
+        environment: ket site, physical metric, then bra site."""
+        result = node if env is None else node @ env
+        if matrix_node is not None:
+            result = result @ matrix_node
+        result = result @ copied_node
         if renormalize:
-            axes = [axis.name for axis in result.axes
-                    if not axis.is_batch()]
-            if axes:
-                result = result.renormalize(axis=axes)
-
+            result = self._renormalize_sample_env(result)
         return result
+
+    @staticmethod
+    def _sample_candidate(node: AbstractNode, axis_name: Text) -> Node:
+        """A view of ``node`` whose physical edge is its own, open and named
+        ``axis_name``. Bond edges stay shared with the environments, so the
+        view contracts with them."""
+        candidate = node.permute(tuple(range(node.ndim)))
+        candidate.reattach_edges(axes=['input'])
+        candidate.disconnect('input')
+        candidate.get_axis('input').name = axis_name
+        return candidate
 
     @staticmethod
     def _trapezoidal_weights(domain: torch.Tensor) -> torch.Tensor:
@@ -2355,29 +2335,173 @@ class MPS(TensorNetwork):  # MARK: MPS
 
         return in_condition, n_samples
 
+    def _build_sample_right_chains(self,
+                                   bra_nodes: List[AbstractNode],
+                                   condition_nodes: List[Optional[
+                                       Tuple[Node, Node]]],
+                                   right_ket: Optional[AbstractNode],
+                                   right_bra: Optional[AbstractNode],
+                                   renormalize: bool
+                                   ) -> List[Tuple[Optional[AbstractNode],
+                                                   Optional[AbstractNode]]]:
+        """Right environments for conditioned sampling, built right to left.
+
+        Every input node to the right is fixed by its data, so ket and bra stay
+        two single-layer chains: one vector per sample (and per value of the
+        open output edges), instead of a double-layer matrix. Entry ``site``
+        holds the ``(ket, bra)`` environments of the sites right of ``site``.
+        """
+        right_envs = [None] * self._n_sites
+        right_envs[-1] = (right_ket, right_bra)
+
+        for site in range(self._n_sites - 1, 0, -1):
+            node, bra_node = self._mats_env[site], bra_nodes[site]
+            right_ket = node if right_ket is None else node @ right_ket
+            right_bra = bra_node if right_bra is None else bra_node @ right_bra
+            if condition_nodes[site] is not None:
+                data_node, bra_data_node = condition_nodes[site]
+                right_ket = right_ket @ data_node
+                right_bra = right_bra @ bra_data_node
+            if renormalize:
+                right_ket = self._renormalize_sample_env(right_ket)
+                right_bra = self._renormalize_sample_env(right_bra)
+            right_envs[site - 1] = (right_ket, right_bra)
+
+        return right_envs
+
     def _build_sample_right_envs(self,
-                                 copied_nodes: List[Node],
+                                 bra_nodes: List[AbstractNode],
                                  matrix_nodes: List[Optional[Node]],
-                                 condition_nodes: List[Optional[
-                                     Tuple[Node, Node]]],
-                                 right_env: Optional[Node],
-                                 renormalize: bool) -> List[Node]:
-        """Builds reusable right environments with a right-to-left zip-up."""
+                                 right_env: Optional[AbstractNode],
+                                 renormalize: bool) -> List[Optional[Node]]:
+        """Right environments for unconditioned sampling, built right to left.
+
+        The sites to the right are marginalized, so each is absorbed as a
+        double layer through its physical metric. Nothing here depends on the
+        samples: the environments have no batch edge and are built once.
+        Entry ``site`` holds the environment of the sites right of ``site``.
+        """
         right_envs = [None] * self._n_sites
         right_envs[-1] = right_env
 
         for site in range(self._n_sites - 1, 0, -1):
             right_env = self._contract_sample_site(
                 node=self._mats_env[site],
-                copied_node=copied_nodes[site],
+                copied_node=bra_nodes[site],
                 env=right_env,
                 matrix_node=matrix_nodes[site],
-                data_nodes=condition_nodes[site],
-                from_left=False,
                 renormalize=renormalize)
             right_envs[site - 1] = right_env
 
         return right_envs
+
+    @staticmethod
+    def _sample_density(half: AbstractNode,
+                        bra_half: AbstractNode,
+                        right_env,
+                        canonical: bool) -> Node:
+        """The reduced density matrix of one site's physical edge.
+
+        ``half`` is the left environment contracted with the site's candidate
+        view (ket), ``bra_half`` its conjugate. Joined through the right
+        environment they give a node with axes ``candidate`` and
+        ``candidate_copy`` (and ``batch``): the Born weights of every value of
+        the site, given the rest, as a quadratic form. Joining ket and bra also
+        closes the output edges between them, which marginalizes the outputs.
+        """
+        if canonical:
+            # Right-canonical form: the right environment is the identity,
+            # i.e. the two right bonds joined directly (on views, so the
+            # halves keep their bonds to the next site).
+            half = half.permute(tuple(range(half.ndim)))
+            bra_half = bra_half.permute(tuple(range(bra_half.ndim)))
+            for aux_half in (half, bra_half):
+                aux_half.reattach_edges(axes=['right'])
+                aux_half.disconnect('right')
+            half['right'] ^ bra_half['right']
+        elif isinstance(right_env, tuple):
+            right_ket, right_bra = right_env
+            if right_ket is not None:
+                half = half @ right_ket
+                bra_half = bra_half @ right_bra
+        elif right_env is not None:
+            half = half @ right_env
+        return MPS._join_layers(half, bra_half)
+
+    @staticmethod
+    def _join_layers(ket: AbstractNode, bra: AbstractNode) -> Node:
+        """Contracts a ket node with a bra node. When nothing connects them
+        (no output edge, no bond left open: a product of the two layers), only
+        their batch edges are shared, which ``@`` does not accept; ``einsum``
+        then takes the product, batch edge by batch edge."""
+        if ket.is_connected_to(bra):
+            return ket @ bra
+        letters = iter('abcdefghijklmnopqrstuvwxyz')
+        index = {}
+        strings = []
+        for node in (ket, bra):
+            string = ''
+            for axis in node.axes:
+                key = axis.name if axis.is_batch() else (id(node), axis.name)
+                if key not in index:
+                    index[key] = next(letters)
+                string += index[key]
+            strings.append(string)
+        out = ''.join(dict.fromkeys(strings[0] + strings[1]))
+        return op.einsum(f'{strings[0]},{strings[1]}->{out}', ket, bra)
+
+    def _sample_probabilities(self,
+                              density: AbstractNode,
+                              embedded: torch.Tensor,
+                              per_sample: bool) -> torch.Tensor:
+        """Evaluates the density's quadratic form at every embedded candidate:
+        ``(rows, domain_size)``, with one row, or one per sample."""
+        axes_names = ('batch', 'domain_batch', 'feature') if per_sample \
+            else ('domain_batch', 'feature')
+        candidate_data = Node(tensor=embedded,
+                              axes_names=axes_names,
+                              name='sample_candidate_data',
+                              network=self,
+                              data=True)
+        copied_candidate_data = Node(tensor=embedded,
+                                     axes_names=axes_names,
+                                     name='sample_candidate_data_copy',
+                                     network=self,
+                                     data=True)
+        copied_candidate_data = copied_candidate_data.conj()
+        copied_candidate_data.reattach_edges(axes=['feature'])
+
+        density.reattach_edges(axes=['candidate', 'candidate_copy'])
+        candidate_data['feature'] ^ density['candidate']
+        copied_candidate_data['feature'] ^ density['candidate_copy']
+        probs_node = (candidate_data @ density) @ copied_candidate_data
+
+        domain_axis = probs_node.get_axis_num('domain_batch')
+        probs = probs_node.tensor.movedim(domain_axis, -1)
+        return probs.reshape(-1, embedded.shape[-2])
+
+    def _sample_absorb(self,
+                       half: AbstractNode,
+                       axis_name: Text,
+                       embedded: torch.Tensor,
+                       conj: bool,
+                       renormalize: bool) -> Node:
+        """Closes a half's open physical edge with the drawn values: the next
+        left environment of the ket (or, with ``conj``, of the bra)."""
+        selected_data = Node(tensor=embedded,
+                             axes_names=('batch', 'feature'),
+                             name='sample_selected_data',
+                             network=self,
+                             data=True)
+        if conj:
+            selected_data = selected_data.conj()
+            selected_data.reattach_edges(axes=['feature'])
+        half.reattach_edges(axes=[axis_name])
+        selected_data['feature'] ^ half[axis_name]
+        result = half @ selected_data
+        if renormalize:
+            result = self._renormalize_sample_env(result)
+        return result
 
     @torch.no_grad()
     def sample(self,
@@ -2546,7 +2670,9 @@ class MPS(TensorNetwork):  # MARK: MPS
             build_matrices=build_matrices,
             n_samples=n_samples)
 
-        # Sampling builds a temporary double layer in the current network.
+        # Sampling builds a temporary bra layer (a conjugated copy) in the
+        # current network. Output nodes join ket and bra through their physical
+        # edges, so contracting the two layers marginalizes them.
         if self._resultant_nodes:
             warnings.warn(
                 'Resultant nodes will be removed before sampling the MPS')
@@ -2554,58 +2680,15 @@ class MPS(TensorNetwork):  # MARK: MPS
         if self._data_nodes:
             self.unset_data_nodes()
 
-        copied_nodes, copied_left, copied_right = self._copy_sample_mps()
+        bra_nodes, bra_left, bra_right = self._copy_sample_mps()
+        bra_nodes = [node.conj() for node in bra_nodes]
+        for bra_node in bra_nodes:
+            bra_node.reattach_edges(axes=['input'])
+        if self._boundary == 'obc':
+            bra_left = bra_left.conj()
+            bra_right = bra_right.conj()
 
-        # For PBC, insert an identity on each periodic edge. The combined
-        # identity is the initial left environment and keeps the ring connected.
-        if self._boundary == 'pbc':
-            self._mats_env[-1]['right'].disconnect()
-            copied_nodes[-1]['right'].disconnect()
-
-            closure = Node(
-                tensor=torch.eye(self._mats_env[-1]['right'].size(),
-                                 device=self._mats_env[-1].device,
-                                 dtype=self._mats_env[-1].dtype),
-                axes_names=('right', 'left'),
-                name='virtual_result_sample_closure',
-                network=self,
-                virtual=True)
-            copied_closure = Node(
-                shape=closure.shape,
-                axes_names=closure.axes_names,
-                name='virtual_result_sample_closure_copy',
-                network=self,
-                virtual=True)
-            copied_closure.set_tensor_from(closure)
-
-            self._mats_env[-1]['right'] ^ closure['right']
-            closure['left'] ^ self._mats_env[0]['left']
-            copied_nodes[-1]['right'] ^ copied_closure['right']
-            copied_closure['left'] ^ copied_nodes[0]['left']
-
-            copied_nodes = [node.conj() for node in copied_nodes]
-            copied_closure = copied_closure.conj()
-            left_env = closure % copied_closure
-            right_env = None
-        else:
-            if canonical:
-                for i in range(self._n_sites - 1):
-                    self._mats_env[i]['right'].disconnect()
-                    copied_nodes[i]['right'].disconnect()
-                self._mats_env[-1]['right'].disconnect()
-                copied_nodes[-1]['right'].disconnect()
-
-            copied_nodes = [node.conj() for node in copied_nodes]
-            copied_left = copied_left.conj()
-            copied_right = copied_right.conj()
-            left_env = self._left_node % copied_left
-            right_env = None if canonical \
-                else self._right_node % copied_right
-
-        for copied_node in copied_nodes:
-            copied_node.reattach_edges(axes=['input'])
-
-        # Connect physical metrics or right-context data to both layers.
+        # Connect physical metrics or conditioning data to both layers.
         matrix_nodes = [None] * self._n_sites
         condition_nodes = [None] * self._n_sites
         if in_condition is not None:
@@ -2624,12 +2707,12 @@ class MPS(TensorNetwork):  # MARK: MPS
                     data=True)
                 copied_data = copied_data.conj()
                 copied_data.reattach_edges(axes=['feature'])
-                copied_data['feature'] ^ copied_nodes[site]['input']
+                copied_data['feature'] ^ bra_nodes[site]['input']
                 condition_nodes[site] = (data_node, copied_data)
 
         input_idx = 0
-        for site, (node, copied_node) in enumerate(
-                zip(self._mats_env, copied_nodes)):
+        for site, (node, bra_node) in enumerate(zip(self._mats_env,
+                                                    bra_nodes)):
             if site in self._in_features:
                 if condition_nodes[site] is None:
                     matrix_node = Node(
@@ -2639,90 +2722,57 @@ class MPS(TensorNetwork):  # MARK: MPS
                         network=self,
                         virtual=True)
                     node['input'] ^ matrix_node['input']
-                    matrix_node['input_copy'] ^ copied_node['input']
+                    matrix_node['input_copy'] ^ bra_node['input']
                     matrix_nodes[site] = matrix_node
                 input_idx += 1
             else:
-                node['input'] ^ copied_node['input']
+                node['input'] ^ bra_node['input']
 
+        # Right environments: two single-layer chains when conditioned, one
+        # batch-free double layer when marginalized, none when canonical.
+        if self._boundary == 'obc':
+            left_ket, left_bra = self._left_node, bra_left
+        else:
+            left_ket, left_bra = None, None
         if canonical:
             right_envs = [None] * self._n_sites
+        elif in_condition is not None:
+            right_envs = self._build_sample_right_chains(
+                bra_nodes=bra_nodes,
+                condition_nodes=condition_nodes,
+                right_ket=self._right_node if self._boundary == 'obc' else None,
+                right_bra=bra_right,
+                renormalize=renormalize)
         else:
             right_envs = self._build_sample_right_envs(
-                copied_nodes=copied_nodes,
+                bra_nodes=bra_nodes,
                 matrix_nodes=matrix_nodes,
-                condition_nodes=condition_nodes,
-                right_env=right_env,
+                right_env=(self._right_node % bra_right
+                           if self._boundary == 'obc' else None),
                 renormalize=renormalize)
 
-        # Sweep from left to right, sampling one input node at a time.
+        # Sweep from left to right, sampling one input node at a time. The left
+        # environment is always single-layer: every site to the left is fixed.
         samples = []
         sample_indices = []
         input_idx = 0
 
         for site in range(self._n_sites):
+            node, bra_node = self._mats_env[site], bra_nodes[site]
             if site in self._in_features:
-                node = self._mats_env[site]
-                copied_node = copied_nodes[site]
-                right_env = right_envs[site]
+                half = self._sample_candidate(node, 'candidate')
+                bra_half = self._sample_candidate(bra_node, 'candidate_copy')
+                if left_ket is not None:
+                    half = left_ket @ half
+                    bra_half = left_bra @ bra_half
 
-                if canonical:
-                    copied_node.reattach_edges(axes=['right'])
-                    right_env = Node(
-                        tensor=torch.eye(node['right'].size(),
-                                         device=node.device,
-                                         dtype=node.dtype),
-                        axes_names=('right', 'right_copy'),
-                        name='virtual_result_sample_right_env',
-                        network=self,
-                        virtual=True)
-                    node['right'] ^ right_env['right']
-                    copied_node['right'] ^ right_env['right_copy']
-
-                # Replace only the physical edges to evaluate all candidates;
-                # bond edges remain inherited from the stored environments.
-                candidate = node.permute(tuple(range(node.ndim)))
-                copied_candidate = copied_node.permute(
-                    tuple(range(copied_node.ndim)))
-                candidate.reattach_edges(axes=['input'])
-                copied_candidate.reattach_edges(axes=['input'])
-                candidate.disconnect('input')
-                copied_candidate.disconnect('input')
-
-                # A per-sample domain shares the samples' batch edge.
+                # Contract everything but the site's physical edge, then
+                # evaluate the candidates on that small density matrix.
+                density = self._sample_density(half, bra_half,
+                                               right_envs[site], canonical)
                 per_sample = domains[input_idx].ndim == 2
-                candidate_data = Node(
-                    tensor=embeddings[input_idx],
-                    axes_names=(('batch', 'domain_batch', 'feature')
-                                if per_sample
-                                else ('domain_batch', 'feature')),
-                    name='sample_candidate_data',
-                    network=self,
-                    data=True)
-                copied_candidate_data = Node(
-                    tensor=candidate_data.tensor,
-                    axes_names=candidate_data.axes_names,
-                    name='sample_candidate_data_copy',
-                    network=self,
-                    data=True)
-                copied_candidate_data = copied_candidate_data.conj()
-                copied_candidate_data.reattach_edges(axes=['feature'])
-                candidate_data['feature'] ^ candidate['input']
-                copied_candidate_data['feature'] ^ \
-                    copied_candidate['input']
-
-                candidate = candidate_data @ candidate
-                copied_candidate = copied_candidate_data @ copied_candidate
-                probs_node = left_env @ candidate
-                if right_env is not None:
-                    probs_node = probs_node @ right_env
-                probs_node = probs_node @ copied_candidate
-                if probs_node.is_connected_to(probs_node):
-                    probs_node @= probs_node
-
-                domain_axis = probs_node.get_axis_num('domain_batch')
-                probs = probs_node.tensor.movedim(domain_axis, -1)
-                probs = probs.reshape(-1, embeddings[input_idx].shape[-2])
+                probs = self._sample_probabilities(
+                    density, embeddings[input_idx], per_sample)
                 if probs.shape[0] == 1 and n_samples > 1:
                     probs = probs.expand(n_samples, -1)
 
@@ -2742,59 +2792,25 @@ class MPS(TensorNetwork):  # MARK: MPS
                     samples.append(domains[input_idx][ids])
                     selected_embedding = embeddings[input_idx][ids]
 
-                # Absorb the selected values into the reusable left environment.
-                selected = node.permute(node.axes_names)
-                copied_selected = copied_node.permute(copied_node.axes_names)
-                selected.reattach_edges(axes=['input'])
-                copied_selected.reattach_edges(axes=['input'])
-                selected.disconnect('input')
-                copied_selected.disconnect('input')
-
-                selected_data = Node(
-                    tensor=selected_embedding,
-                    axes_names=('batch', 'feature'),
-                    name='sample_selected_data',
-                    network=self,
-                    data=True)
-                copied_selected_data = Node(
-                    tensor=selected_data.tensor,
-                    axes_names=selected_data.axes_names,
-                    name='sample_selected_data_copy',
-                    network=self,
-                    data=True)
-                copied_selected_data = copied_selected_data.conj()
-                copied_selected_data.reattach_edges(axes=['feature'])
-                selected_data['feature'] ^ selected['input']
-                copied_selected_data['feature'] ^ copied_selected['input']
-
-                left_env = self._contract_sample_site(
-                    node=selected,
-                    copied_node=copied_selected,
-                    env=left_env,
-                    data_nodes=(selected_data, copied_selected_data),
-                    from_left=True,
-                    renormalize=renormalize)
+                # Absorb the drawn values into the left environments.
+                left_ket = self._sample_absorb(half, 'candidate',
+                                               selected_embedding,
+                                               conj=False,
+                                               renormalize=renormalize)
+                left_bra = self._sample_absorb(bra_half, 'candidate_copy',
+                                               selected_embedding,
+                                               conj=True,
+                                               renormalize=renormalize)
                 input_idx += 1
 
             else:
-                left_env = self._contract_sample_site(
-                    node=self._mats_env[site],
-                    copied_node=copied_nodes[site],
-                    env=left_env,
-                    from_left=True,
-                    renormalize=renormalize)
-
-            if canonical and site < (self._n_sites - 1):
-                right_axes = [axis.name for axis in left_env.axes
-                              if ('right' in axis.name) and
-                              (not axis.is_batch())]
-                left_env.reattach_edges(axes=right_axes)
-                for axis in right_axes:
-                    left_env.disconnect(axis)
-
-                copied_nodes[site + 1].reattach_edges(axes=['left'])
-                left_env[right_axes[0]] ^ self._mats_env[site + 1]['left']
-                left_env[right_axes[1]] ^ copied_nodes[site + 1]['left']
+                # An output node: its edge to the bra stays open in both
+                # chains until a density closes it.
+                left_ket = node if left_ket is None else left_ket @ node
+                left_bra = bra_node if left_bra is None else left_bra @ bra_node
+                if renormalize:
+                    left_ket = self._renormalize_sample_env(left_ket)
+                    left_bra = self._renormalize_sample_env(left_bra)
 
         # Collect values in the order of ``in_features``.
         samples = torch.stack(samples, dim=1)
@@ -2802,12 +2818,6 @@ class MPS(TensorNetwork):  # MARK: MPS
 
         self.reset()
         self.unset_data_nodes()
-        if self._boundary == 'pbc':
-            self._mats_env[-1]['right'] ^ self._mats_env[0]['left']
-        elif canonical:
-            for i in range(self._n_sites - 1):
-                self._mats_env[i]['right'] ^ self._mats_env[i + 1]['left']
-            self._mats_env[-1]['right'] ^ self._right_node['left']
 
         if return_indices:
             return samples, sample_indices
