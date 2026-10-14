@@ -1876,6 +1876,56 @@ class TestMPS:  # MARK: TestMPS
         expected = torch.tensor([0.5, 1.5, 1.]) / 3
         assert torch.allclose(captured[0][0].cpu(), expected)
 
+    @pytest.mark.parametrize('condition', AUTO_BOOL_CASES)
+    def test_sample_per_sample_domain_equal_rows_matches_shared(self,
+                                                                monkeypatch,
+                                                                condition):
+        mps = tk.models.MPS(n_sites=4,
+                            phys_dim=3,
+                            bond_dim=3,
+                            boundary='obc',
+                            out_features=[2])
+        domain = torch.linspace(-1, 1, 5)
+        kwargs = dict(n_samples=3, embedding=tk.embeddings.poly)
+        if condition:
+            kwargs['in_condition'] = tk.embeddings.poly(
+                2 * torch.rand(3, 3) - 1, degree=2).to(mps.mats_env[0].dtype)
+
+        captured = self._capture_multinomial_probs(monkeypatch)
+        shared, _ = mps.sample(domain=domain, return_indices=True, **kwargs)
+        shared_probs = [p.clone() for p in captured]
+        captured.clear()
+        per_sample, _ = mps.sample(domain=domain.expand(3, -1),
+                                   return_indices=True,
+                                   **kwargs)
+
+        assert len(captured) == len(shared_probs) == 3
+        for p, q in zip(captured, shared_probs):
+            assert torch.allclose(p, q, atol=1e-6)
+        assert torch.equal(per_sample, shared)
+
+    def test_sample_per_sample_domain_values_come_from_own_row(self):
+        mps = tk.models.MPS(n_sites=3, phys_dim=2, bond_dim=2, boundary='obc')
+        domain = torch.arange(3 * 4, dtype=torch.float).view(3, 4) / 12
+        samples = mps.sample(n_samples=3,
+                             domain=domain,
+                             embedding=tk.embeddings.unit)
+        for row in range(3):
+            assert torch.isin(samples[row], domain[row]).all()
+
+    def test_sample_per_sample_domain_rejects_wrong_rows_and_build_matrices(
+            self):
+        mps = tk.models.MPS(n_sites=3, phys_dim=2, bond_dim=2, boundary='obc')
+        with pytest.raises(ValueError, match='`n_samples` rows'):
+            mps.sample(n_samples=3,
+                       domain=torch.rand(2, 4),
+                       embedding=tk.embeddings.unit)
+        with pytest.raises(ValueError, match='`build_matrices`'):
+            mps.sample(n_samples=2,
+                       domain=torch.rand(2, 4).sort(-1).values,
+                       embedding=tk.embeddings.unit,
+                       build_matrices=True)
+
     @pytest.mark.parametrize('runtime', RUNTIME_CASES)
     @pytest.mark.parametrize('n_features,boundary,middle_site', ENTROPY_CASES)
     def test_entropy(self, runtime, n_features, boundary, middle_site):
