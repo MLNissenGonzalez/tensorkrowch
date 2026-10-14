@@ -1999,8 +1999,16 @@ class MPS(TensorNetwork):  # MARK: MPS
         return torch.trapezoid(grid_basis, x=domain, dim=0)
 
     @staticmethod
-    def _probabilities_from_amplitudes(probs: torch.Tensor) -> torch.Tensor:
-        """Cleans and row-normalizes Born probabilities."""
+    def _probabilities_from_amplitudes(probs: torch.Tensor
+                                       ) -> Tuple[torch.Tensor, int]:
+        """Cleans and row-normalizes Born probabilities.
+
+        A row with no usable weight (all zero, or any value non-finite) is
+        made uniform; returns the probabilities and the number of such rows.
+        """
+        unusable = ~torch.isfinite(probs).all(dim=1)
+        probs = torch.where(unusable[:, None], torch.zeros_like(probs), probs)
+
         if torch.is_complex(probs):
             scale = probs.abs().max().detach()
             imag = probs.imag.abs().max().detach()
@@ -2014,9 +2022,6 @@ class MPS(TensorNetwork):  # MARK: MPS
         if not torch.is_floating_point(probs):
             probs = probs.float()
 
-        if not torch.isfinite(probs).all():
-            raise ValueError('Probabilities contain non-finite values')
-
         finfo = torch.finfo(probs.dtype)
         scale = probs.abs().max().detach().clamp_min(1)
         tol = 1000 * finfo.eps * scale
@@ -2024,13 +2029,14 @@ class MPS(TensorNetwork):  # MARK: MPS
             raise ValueError(
                 'Some probabilities are negative beyond numerical tolerance')
 
+        # Dividing by the row maximum first keeps the sum finite.
         probs = probs.clamp_min(0)
-        norm = probs.sum(dim=1, keepdim=True)
-        if (norm <= 0).any() or (not torch.isfinite(norm).all()):
-            raise ValueError(
-                'Cannot sample from a zero or non-finite probability row')
-
-        return probs / norm
+        row_max = probs.amax(dim=1, keepdim=True)
+        unusable = unusable | (row_max.squeeze(1) <= 0)
+        probs = torch.where(unusable[:, None], torch.ones_like(probs),
+                            probs / row_max.clamp_min(finfo.tiny))
+        n_unusable = int(unusable.sum())
+        return probs / probs.sum(dim=1, keepdim=True), n_unusable
 
     def _sample_apply_embedding(self,
                                 domain: torch.Tensor,
@@ -2335,37 +2341,30 @@ class MPS(TensorNetwork):  # MARK: MPS
 
         return in_condition, n_samples
 
-    def _build_sample_right_chains(self,
-                                   bra_nodes: List[AbstractNode],
-                                   condition_nodes: List[Optional[
-                                       Tuple[Node, Node]]],
-                                   right_ket: Optional[AbstractNode],
-                                   right_bra: Optional[AbstractNode],
-                                   renormalize: bool
-                                   ) -> List[Tuple[Optional[AbstractNode],
-                                                   Optional[AbstractNode]]]:
-        """Right environments for conditioned sampling, built right to left.
+    def _build_sample_right_chain(self,
+                                  data_nodes: List[Optional[Node]],
+                                  right_ket: Optional[AbstractNode],
+                                  renormalize: bool
+                                  ) -> List[Optional[AbstractNode]]:
+        """Right environments of a sweep, built right to left.
 
-        Every input node to the right is fixed by its data, so ket and bra stay
-        two single-layer chains: one vector per sample (and per value of the
-        open output edges), instead of a double-layer matrix. Entry ``site``
-        holds the ``(ket, bra)`` environments of the sites right of ``site``.
+        Every input node to the right is fixed by its data, so the environment
+        is one single-layer chain: a vector per sample (and per value of the
+        open output edges), contracted environment first, so it never holds
+        more than bond × physical dimension per sample. Entry ``site`` holds the
+        environment of the sites right of ``site``.
         """
         right_envs = [None] * self._n_sites
-        right_envs[-1] = (right_ket, right_bra)
+        right_envs[-1] = right_ket
 
         for site in range(self._n_sites - 1, 0, -1):
-            node, bra_node = self._mats_env[site], bra_nodes[site]
+            node = self._mats_env[site]
             right_ket = node if right_ket is None else node @ right_ket
-            right_bra = bra_node if right_bra is None else bra_node @ right_bra
-            if condition_nodes[site] is not None:
-                data_node, bra_data_node = condition_nodes[site]
-                right_ket = right_ket @ data_node
-                right_bra = right_bra @ bra_data_node
+            if data_nodes[site] is not None:
+                right_ket = right_ket @ data_nodes[site]
             if renormalize:
                 right_ket = self._renormalize_sample_env(right_ket)
-                right_bra = self._renormalize_sample_env(right_bra)
-            right_envs[site - 1] = (right_ket, right_bra)
+            right_envs[site - 1] = right_ket
 
         return right_envs
 
@@ -2394,6 +2393,32 @@ class MPS(TensorNetwork):  # MARK: MPS
             right_envs[site - 1] = right_env
 
         return right_envs
+
+    @staticmethod
+    def _sample_sweep_density(half: AbstractNode,
+                              right_env: Optional[AbstractNode]) -> Node:
+        """The reduced density matrix of one site in a sweep.
+
+        ``half`` is the left environment contracted with the site's candidate
+        view; with the right environment it gives the ket ``w``: one vector over
+        the candidate edge per sample and value of the open output edges. The
+        density is ``w`` joined with its conjugate over the output edges,
+        ρ = Σ_c w_c w_c†, which sums the outputs out.
+        """
+        if right_env is None:
+            ket = half.permute(tuple(range(half.ndim)))
+        else:
+            ket = half @ right_env
+        open_axes = [axis.name for axis in ket.axes
+                     if (not axis.is_batch()) and (axis.name != 'candidate')]
+        bra = ket.conj()
+        bra.reattach_edges(axes=open_axes + ['candidate'])
+        bra.get_axis('candidate').name = 'candidate_copy'
+        if open_axes:
+            ket.reattach_edges(axes=open_axes)
+            for name in open_axes:
+                ket[name] ^ bra[name]
+        return MPS._join_layers(ket, bra)
 
     @staticmethod
     def _sample_density(half: AbstractNode,
@@ -2670,9 +2695,6 @@ class MPS(TensorNetwork):  # MARK: MPS
             build_matrices=build_matrices,
             n_samples=n_samples)
 
-        # Sampling builds a temporary bra layer (a conjugated copy) in the
-        # current network. Output nodes join ket and bra through their physical
-        # edges, so contracting the two layers marginalizes them.
         if self._resultant_nodes:
             warnings.warn(
                 'Resultant nodes will be removed before sampling the MPS')
@@ -2680,41 +2702,46 @@ class MPS(TensorNetwork):  # MARK: MPS
         if self._data_nodes:
             self.unset_data_nodes()
 
-        bra_nodes, bra_left, bra_right = self._copy_sample_mps()
-        bra_nodes = [node.conj() for node in bra_nodes]
-        for bra_node in bra_nodes:
-            bra_node.reattach_edges(axes=['input'])
-        if self._boundary == 'obc':
-            bra_left = bra_left.conj()
-            bra_right = bra_right.conj()
-
-        # Connect physical metrics or conditioning data to both layers.
-        matrix_nodes = [None] * self._n_sites
-        condition_nodes = [None] * self._n_sites
-        if in_condition is not None:
+        # With ``in_condition`` every variable but the one being sampled is
+        # fixed (a sweep): the ket alone suffices, one vector per sample and
+        # value of the open output edges, and each site's density is the ket
+        # joined with its own conjugate. Otherwise the sites to the right are
+        # summed out, which needs a bra layer (a conjugated copy) in this
+        # network; output nodes join ket and bra through their physical edges,
+        # so contracting the two layers marginalizes them.
+        sweep = in_condition is not None
+        if sweep:
             super().set_data_nodes(
                 input_edges=[node['input'] for node in self.in_env],
                 num_batch_edges=1)
             self.add_data(in_condition)
-            data_nodes = list(self.data_nodes.values())
+            data_nodes = [None] * self._n_sites
+            for site, data_node in zip(self._in_features,
+                                       self.data_nodes.values()):
+                data_nodes[site] = data_node
 
-            for site, data_node in zip(self._in_features, data_nodes):
-                copied_data = Node(
-                    tensor=data_node.tensor,
-                    axes_names=data_node.axes_names,
-                    name='sample_data_copy',
-                    network=self,
-                    data=True)
-                copied_data = copied_data.conj()
-                copied_data.reattach_edges(axes=['feature'])
-                copied_data['feature'] ^ bra_nodes[site]['input']
-                condition_nodes[site] = (data_node, copied_data)
+            left_ket, left_bra = None, None
+            if self._boundary == 'obc':
+                left_ket = self._left_node
+            right_envs = self._build_sample_right_chain(
+                data_nodes=data_nodes,
+                right_ket=self._right_node if self._boundary == 'obc' else None,
+                renormalize=renormalize)
+        else:
+            bra_nodes, bra_left, bra_right = self._copy_sample_mps()
+            bra_nodes = [node.conj() for node in bra_nodes]
+            for bra_node in bra_nodes:
+                bra_node.reattach_edges(axes=['input'])
+            if self._boundary == 'obc':
+                bra_left = bra_left.conj()
+                bra_right = bra_right.conj()
 
-        input_idx = 0
-        for site, (node, bra_node) in enumerate(zip(self._mats_env,
-                                                    bra_nodes)):
-            if site in self._in_features:
-                if condition_nodes[site] is None:
+            # Physical metrics join ket and bra at input nodes.
+            matrix_nodes = [None] * self._n_sites
+            input_idx = 0
+            for site, (node, bra_node) in enumerate(zip(self._mats_env,
+                                                        bra_nodes)):
+                if site in self._in_features:
                     matrix_node = Node(
                         tensor=matrices[input_idx],
                         axes_names=('input', 'input_copy'),
@@ -2724,52 +2751,51 @@ class MPS(TensorNetwork):  # MARK: MPS
                     node['input'] ^ matrix_node['input']
                     matrix_node['input_copy'] ^ bra_node['input']
                     matrix_nodes[site] = matrix_node
-                input_idx += 1
-            else:
-                node['input'] ^ bra_node['input']
+                    input_idx += 1
+                else:
+                    node['input'] ^ bra_node['input']
 
-        # Right environments: two single-layer chains when conditioned, one
-        # batch-free double layer when marginalized, none when canonical.
-        if self._boundary == 'obc':
-            left_ket, left_bra = self._left_node, bra_left
-        else:
+            # Right environments: one batch-free double layer, or none when
+            # canonical.
             left_ket, left_bra = None, None
-        if canonical:
-            right_envs = [None] * self._n_sites
-        elif in_condition is not None:
-            right_envs = self._build_sample_right_chains(
-                bra_nodes=bra_nodes,
-                condition_nodes=condition_nodes,
-                right_ket=self._right_node if self._boundary == 'obc' else None,
-                right_bra=bra_right,
-                renormalize=renormalize)
-        else:
-            right_envs = self._build_sample_right_envs(
-                bra_nodes=bra_nodes,
-                matrix_nodes=matrix_nodes,
-                right_env=(self._right_node % bra_right
-                           if self._boundary == 'obc' else None),
-                renormalize=renormalize)
+            if self._boundary == 'obc':
+                left_ket, left_bra = self._left_node, bra_left
+            if canonical:
+                right_envs = [None] * self._n_sites
+            else:
+                right_envs = self._build_sample_right_envs(
+                    bra_nodes=bra_nodes,
+                    matrix_nodes=matrix_nodes,
+                    right_env=(self._right_node % bra_right
+                               if self._boundary == 'obc' else None),
+                    renormalize=renormalize)
 
         # Sweep from left to right, sampling one input node at a time. The left
         # environment is always single-layer: every site to the left is fixed.
         samples = []
         sample_indices = []
         input_idx = 0
+        n_unusable = 0
 
         for site in range(self._n_sites):
-            node, bra_node = self._mats_env[site], bra_nodes[site]
+            node = self._mats_env[site]
             if site in self._in_features:
-                half = self._sample_candidate(node, 'candidate')
-                bra_half = self._sample_candidate(bra_node, 'candidate_copy')
-                if left_ket is not None:
-                    half = left_ket @ half
-                    bra_half = left_bra @ bra_half
-
                 # Contract everything but the site's physical edge, then
                 # evaluate the candidates on that small density matrix.
-                density = self._sample_density(half, bra_half,
-                                               right_envs[site], canonical)
+                half = self._sample_candidate(node, 'candidate')
+                if left_ket is not None:
+                    half = left_ket @ half
+                if sweep:
+                    density = self._sample_sweep_density(half,
+                                                         right_envs[site])
+                else:
+                    bra_half = self._sample_candidate(bra_nodes[site],
+                                                      'candidate_copy')
+                    if left_bra is not None:
+                        bra_half = left_bra @ bra_half
+                    density = self._sample_density(half, bra_half,
+                                                   right_envs[site],
+                                                   canonical)
                 per_sample = domains[input_idx].ndim == 2
                 probs = self._sample_probabilities(
                     density, embeddings[input_idx], per_sample)
@@ -2777,7 +2803,8 @@ class MPS(TensorNetwork):  # MARK: MPS
                     probs = probs.expand(n_samples, -1)
 
                 probs = probs * quadrature_weights[input_idx].reshape(1, -1)
-                probs = self._probabilities_from_amplitudes(probs)
+                probs, unusable = self._probabilities_from_amplitudes(probs)
+                n_unusable += unusable
                 ids = torch.multinomial(probs,
                                         num_samples=1,
                                         replacement=True,
@@ -2797,20 +2824,25 @@ class MPS(TensorNetwork):  # MARK: MPS
                                                selected_embedding,
                                                conj=False,
                                                renormalize=renormalize)
-                left_bra = self._sample_absorb(bra_half, 'candidate_copy',
-                                               selected_embedding,
-                                               conj=True,
-                                               renormalize=renormalize)
+                if not sweep:
+                    left_bra = self._sample_absorb(bra_half, 'candidate_copy',
+                                                   selected_embedding,
+                                                   conj=True,
+                                                   renormalize=renormalize)
                 input_idx += 1
 
             else:
-                # An output node: its edge to the bra stays open in both
-                # chains until a density closes it.
+                # An output node: its physical edge stays open (to the bra,
+                # or dangling in a sweep) until a density closes it.
                 left_ket = node if left_ket is None else left_ket @ node
-                left_bra = bra_node if left_bra is None else left_bra @ bra_node
                 if renormalize:
                     left_ket = self._renormalize_sample_env(left_ket)
-                    left_bra = self._renormalize_sample_env(left_bra)
+                if not sweep:
+                    bra_node = bra_nodes[site]
+                    left_bra = bra_node if left_bra is None \
+                        else left_bra @ bra_node
+                    if renormalize:
+                        left_bra = self._renormalize_sample_env(left_bra)
 
         # Collect values in the order of ``in_features``.
         samples = torch.stack(samples, dim=1)
@@ -2818,6 +2850,11 @@ class MPS(TensorNetwork):  # MARK: MPS
 
         self.reset()
         self.unset_data_nodes()
+
+        if n_unusable:
+            warnings.warn(
+                f'{n_unusable} of {samples.numel()} draws had no usable '
+                'weight (all zero or non-finite); drawn uniformly')
 
         if return_indices:
             return samples, sample_indices
