@@ -116,6 +116,11 @@ the source or by a probe; guesses are marked as such.
 
 ## This branch (`sampling-efficiency`)
 
+**Superseded for the sampler (2026-10-15)** by branch `sample-density` (the PR for
+José, 4 commits on develop) and bm4tc's D106; see "Since: `sample-density`" below.
+This branch keeps the D100–D103 history (step 3's open leg for the class, rejected
+since: memory d_out^k for k output sites).
+
 One commit per bm4tc step, each bm4tc `sampling.py` translated back to develop's
 names (the translation of bm4tc's step 1 reproduces develop byte for byte):
 
@@ -134,3 +139,29 @@ inheritance through result nodes; a norm-keeping `renormalize`; a public way to
 "contract with reuse" (forward's replay forbids Python side effects in `contract`,
 and the trace bookkeeping is only reachable through private flags);
 `reset` reordering `parameters()`.
+
+## Since: `sample-density` (bm4tc D106, 2026-10-15)
+
+- **Double layers only where something is summed.** An environment is double-layer
+  only if it contains a summed site (an output node; without `in_condition`, the
+  inputs to the right of the drawn site); elsewhere the ket alone. With both
+  environments single, a site's weights are |amplitude|² per candidate; otherwise
+  quadratic forms on its density matrix.
+- **Fixed sampling nodes.** Each step of the sweep (a right environment absorbing a
+  site, the left one absorbing a drawn or summed site, a site's weights) is a small
+  network of virtual leaves (`virtual_result_sample_*`, own edges connected once),
+  built at its first use. Later sites set the leaves' tensors with
+  `_direct_set_tensor` (no shape check; batch and candidate sizes may vary, since
+  `_permute_contract_reshape` uses runtime shapes) and repeat the same operations,
+  which hit their successors: no nodes per site, and memory does not grow with the
+  number of sites except for the right environments kept for the sweep. Environments
+  pass between steps as tensors, permuted to the leaf's axis order by name. Nothing
+  is copied from the MPS and none of its edges is touched, so the `@`-on-batch-only,
+  edge-inheritance and copy-and-move issues above are no longer met by `sample`.
+- **Float32 precision (open).** A double layer is positive semi-definite in exact
+  arithmetic only: it sums ket × bra products, so its rounding error grows like the
+  square of the contraction's cancellation (one layer: linearly). develop has it
+  too (−2.7e-3 of a row's maximum at 784 sites, bond 40, a narrow window);
+  `sample-density` −8e-4 there, up to −4.6% with per-sample windows; float64 clean.
+  Not solved; see bm4tc plan.md, "Sampling" step 6.
+
