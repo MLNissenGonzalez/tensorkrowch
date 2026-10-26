@@ -377,6 +377,48 @@ class LogNormMPSChecks:  # MARK: LogNormMPSChecks
         for node, ref_node in zip(mps.mats_env, ref.mats_env):
             assert torch.allclose(node.grad, ref_node.grad)
 
+
+@tk.operation
+def renormalize_log_mps_test_op(node, axis):
+    axis_num = node.get_axis_num(axis)
+    other_axes = [ax for ax in node.axes if ax.num != axis_num]
+    
+    def kernel(tensor):
+        norm = tensor.norm(dim=axis_num, keepdim=True)
+        norm = torch.where(norm == 0., 1., norm)
+        return tensor / norm, norm.log().squeeze(axis_num)
+    
+    return kernel, (node.axes, other_axes)
+
+
+class OperationLogNormMPS(tk.models.MPS):
+    """
+    MPS whose contraction renormalizes the result after each site and
+    accumulates the norms in log scale, with a custom :func:`operation`.
+    """
+    
+    def contract(self):
+        mats_env = self._input_contraction(
+            nodes_env=self.in_env,
+            input_nodes=[node.neighbours('input') for node in self.in_env])
+        
+        result = self._left_node
+        log_norm = None
+        for node in mats_env:
+            result @= node
+            result, log_n = renormalize_log_mps_test_op(result, 'right')
+            if log_norm is None:
+                log_norm = log_n
+            else:
+                log_norm = log_norm + log_n
+        result @= self._right_node
+        
+        return result, log_norm
+
+
+class TestOperationLogNormMPS(LogNormMPSChecks):  # MARK: TestOperationLogNormMPS
+    mps_class = OperationLogNormMPS
+
 class TestMPS:  # MARK: TestMPS
 
     def _get_runtime_kwargs(self, runtime, device):

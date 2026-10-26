@@ -65,6 +65,10 @@ Operation Class
 
 .. autoclass:: Operation
 
+operation
+^^^^^^^^^
+.. autofunction:: operation
+
 
 Tensor-like Operations
 ----------------------
