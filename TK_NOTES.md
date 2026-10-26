@@ -25,7 +25,8 @@ the source or by a probe; guesses are marked as such.
   `_compatible_shape`, `components.py:1305`, lets them differ when a tensor is set).
 - `mul`/`div`/`add`/`sub` by a **tensor or number** key on `(node1,)` alone
   (`_check_first_div`, `operations.py:696`), so dividing by a freshly computed
-  norm tensor still reuses the successor.
+  norm tensor still reuses the successor. (develop-unified: `_elementwise_key`;
+  the replay of these, broken before, now passes the operand again; see below.)
 - Successors survive until `reset`. Reuse needs **the same node objects** as
   operands: a node created anew each call (e.g. a fresh data node per call) makes
   every downstream operation a first call.
@@ -37,7 +38,9 @@ the source or by a probe; guesses are marked as such.
   replays `_seq_ops`** (`self.operations[op](*args)` in order) and returns the last
   result. A replay does not run `contract()`'s Python, so any side effect there
   (bm4tc's log-norm accumulation in an overridden `_inline_contraction`) is skipped.
-  That is why bm4tc used to `reset` around every forward.
+  That is why bm4tc used to `reset` around every forward. (develop-unified: such
+  computations can be `tk.operation`s, and `contract` can return several nodes;
+  see below.)
 - Calling **`contract()` directly** instead runs its Python every time while every
   operation reuses its successor. bm4tc's forward does that now (no reset): values
   and gradients bit-identical, eager no-grad forward 2.5–3× faster.
@@ -96,7 +99,8 @@ the source or by a probe; guesses are marked as such.
   keep the norms). tk's `renormalize` operation divides by the norm and **discards**
   it. A `renormalize` that returns the log-norm as a node of its own would put the
   accumulation on tk's path (trace, successors, replay), and bm4tc's override and
-  special forward could go (in bm4tc's plan as a deep option).
+  special forward could go (in bm4tc's plan as a deep option). (develop-unified:
+  a `tk.operation` does that; `docs/custom_operations.md` §2.3 has the MPS.)
 - 1.1.6 `contract` contracts every site with its data first, (B, r, r) per site,
   and keeps all of them: B·n·r² stored (153 MiB per sample at 784 sites, r160).
   Environment first (as develop's `norm` zips up) would store B·n·r·d.
@@ -113,6 +117,7 @@ the source or by a probe; guesses are marked as such.
   `test_to_contracted` (MPS, UMPS) and `test_deparameterize_preserves_boundary_runtime`
   fail on develop itself; `test_entropy` and `test_canonicalize_univocal_diff_dims`
   fail at random (unseeded shapes). Doctests need `tk` and `torch` in their globals.
+  (develop-unified: both random failures root-caused and fixed; see below.)
 
 ## This branch (`sampling-efficiency`)
 
@@ -165,3 +170,55 @@ and the trace bookkeeping is only reachable through private flags);
   `sample-density` −8e-4 there, up to −4.6% with per-sample windows; float64 clean.
   Not solved; see bm4tc plan.md, "Sampling" step 6.
 
+## Since: `develop-unified` (2026-10-26)
+
+The branch that unites develop's branches of the month: `zipup-input`,
+`fix-cuda-device-tests`, `sample-density`, `sampling-efficiency` (notes and the tests of
+repeated `sample` calls, which `sample-density` passes; its sampler is
+superseded), and `custom-operations`. Then fixes found on the way.
+
+**Operations core** (`docs/custom_operations.md` has primer, guide, design and
+implementation):
+
+- `tk.operation`: a function returning `(kernel, axes)` becomes an `Operation`.
+  The function runs at the first call (it is `fn_first`'s planning), the kernel
+  (any PyTorch) in every call and in the replay. Outputs are resultant nodes,
+  with axes inherited from the operands (names and edges) or new. This removes
+  the reason for the overridden `_inline_contraction` and the special forward:
+  a renormalize that returns its log-norm is a 10-line custom operation.
+- `contract` may return a tuple of nodes; `forward` returns their tensors, also
+  in the replay and after `trace`, and the inverse memory never frees them.
+- One core (`_build_operation`) builds the custom operations and `permute`,
+  `tprod`, `mul`, `div`, `add`, `sub`, `renormalize`, `conj` (825 lines of
+  hand-written `check_first`/`fn_first`/`fn_next` removed). Keys, names and
+  public functions unchanged. These operations now work on StackNodes (they
+  raised, except `renormalize`).
+
+**Fixes:**
+
+- Replay of `mul`/`div`/`add`/`sub` with a tensor or number: `_seq_ops`
+  recorded `(node1,)`, so the second call of such a `contract` failed (missing
+  `node2`). Now it records the operand.
+- `tprod` in a traced network failed in every forward (`_check_inverse_memory`
+  got the tuple of node refs).
+- `reset` kept the successors of the virtual nodes it keeps (user auxiliary
+  virtual nodes, `virtual_uniform`, `stack_data_memory`), pointing to deleted
+  result nodes; a `contract` starting with such a node failed after `reset` and
+  so after every `trace` (the TODO in `reset`).
+- A new leaf node named as an operation raised `RecursionError` instead of the
+  `ValueError`.
+- `stack`/`unbind` indexed with lists of slices, which PyTorch reads as a
+  tensor index in newer versions (it warned all over the suite); now tuples.
+  pytest turns that warning into an error (`pyproject.toml`).
+- `MPS.entropy` gave NaN when a squared Schmidt value underflowed in single
+  precision (0 · log 0): `test_entropy`'s random failures (~15% of draws in
+  complex64).
+- `test_canonicalize_univocal_diff_dims` failed at random because float32
+  rounding of some draws reaches 1e-3 (relative): it runs in float64 now, where
+  the univocal form is exact to 1e-12.
+
+Still open from the list above: the quadratic renaming in `reset` and
+`move_to_network`; `@` on batch-only edges; `einsum`'s connected-edge rule;
+edge inheritance through result nodes; `reset` reordering `parameters()`; the
+trace bookkeeping without the replay (private flags); float32 precision of
+double layers in `sample`.
