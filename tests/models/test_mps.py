@@ -260,7 +260,7 @@ class LogNormMPSChecks:  # MARK: LogNormMPSChecks
     
     @pytest.mark.parametrize('auto_stack', [True, False])
     def test_log_norm_matches_mps(self, auto_stack):
-        mps = self.mps_class(n_features=30,
+        mps = self.mps_class(n_sites=30,
                              phys_dim=2,
                              bond_dim=5,
                              boundary='obc',
@@ -286,7 +286,7 @@ class LogNormMPSChecks:  # MARK: LogNormMPSChecks
             mps.reset()
     
     def test_log_norm_avoids_overflow(self):
-        mps = self.mps_class(n_features=200,
+        mps = self.mps_class(n_sites=200,
                              phys_dim=2,
                              bond_dim=5,
                              boundary='obc',
@@ -308,7 +308,7 @@ class LogNormMPSChecks:  # MARK: LogNormMPSChecks
                               rtol=1e-4)
     
     def test_log_norm_grad(self):
-        mps = self.mps_class(n_features=20,
+        mps = self.mps_class(n_sites=20,
                              phys_dim=2,
                              bond_dim=5,
                              boundary='obc',
