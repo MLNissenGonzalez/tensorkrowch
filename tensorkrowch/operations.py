@@ -119,6 +119,64 @@ class Operation:  # MARK: Operation
             return self.fn_next(successor, *args, **kwargs)
 
 
+def _create_resultant_from_axes(axes: Sequence[Union[Axis, Text]],
+                                name: Text,
+                                network: TensorNetwork,
+                                tensor: Tensor) -> Node:
+    """
+    Creates a ``resultant`` node for an operation whose axes are either axes
+    of the operand nodes (``Axis``), keeping their names and edges, or new axes
+    (``str``), with new dangling edges. If the first axis is the ``"stack"``
+    axis of a (Param)StackNode, the resultant node is a :class:`StackNode`.
+    """
+    if tensor.dim() != len(axes):
+        raise ValueError(
+            f'Tensor with {tensor.dim()} dimensions cannot be the tensor of a '
+            f'node with {len(axes)} axes')
+    
+    axes_names = []
+    for i, axis in enumerate(axes):
+        if isinstance(axis, Axis):
+            if tensor.shape[i] != axis._node._shape[axis._num]:
+                raise ValueError(
+                    f'Size of dimension {i} of the tensor should be equal to '
+                    f'the size of the edge of axis "{axis._name}" in node '
+                    f'"{axis._node._name}"')
+            axes_names.append(axis._name)
+        elif isinstance(axis, str):
+            axes_names.append(axis)
+        else:
+            raise TypeError('Axes of resultant nodes should be Axis or str type')
+    
+    # Only (Param)StackNodes have a "stack" axis
+    if axes and isinstance(axes[0], Axis) and (axes[0]._name == 'stack'):
+        if any([not isinstance(axis, Axis) or
+                not isinstance(axis._node, (StackNode, ParamStackNode))
+                for axis in axes[1:]]):
+            raise ValueError(
+                'If the first axis is the "stack" axis of a (Param)StackNode, '
+                'the rest of axes should also be axes of (Param)StackNodes')
+        return StackNode._create_resultant(
+            axes_names=axes_names,
+            name=name,
+            network=network,
+            tensor=tensor,
+            edges=[axis._node._edges[axis._num] for axis in axes],
+            node1_list=[axis._node1 for axis in axes])
+    
+    new_node = Node._create_resultant(axes_names=axes_names,
+                                      name=name,
+                                      network=network,
+                                      tensor=tensor)
+    for i, axis in enumerate(axes):
+        if isinstance(axis, Axis):
+            network._remove_edge(new_node._edges[i])
+            new_node._add_edge(edge=axis._node._edges[axis._num],
+                               axis=i,
+                               node1=axis._node1)
+    return new_node
+
+
 ###############################################################################
 #                           TENSOR-LIKE OPERATIONS                            #
 ###############################################################################

@@ -3358,6 +3358,82 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
 
         assert not result.norm().isclose(torch.tensor(1.))
 
+    @pytest.fixture
+    def setup_several_outputs(self):
+        class SeveralOutputsTN(tk.TensorNetwork):
+
+            def __init__(self):
+                super().__init__(name='several_outputs_tn')
+                self.node = tk.randn(shape=(3, 4),
+                                     axes_names=('input', 'right'),
+                                     name='node',
+                                     network=self,
+                                     param_node=True)
+
+            def set_data_nodes(self) -> None:
+                super().set_data_nodes([self.node['input']], num_batch_edges=1)
+
+            def contract(self, as_list: bool = False):
+                data_node = self.node.neighbours('input')
+                result = data_node @ self.node
+                # ``result`` is used again, so its tensor could be erased
+                double = result + result
+                if as_list:
+                    return [result, double]
+                return result, double
+
+        return SeveralOutputsTN
+
+    @pytest.mark.parametrize('as_list', [True, False])
+    def test_forward_several_outputs(self, setup_several_outputs, as_list):
+        net = setup_several_outputs()
+
+        for _ in range(2):
+            data = torch.randn(5, 1, 3)
+            expected = data[:, 0] @ net.node.tensor
+
+            for _ in range(2):
+                result, double = net(data, as_list)
+                assert torch.allclose(result, expected)
+                assert torch.allclose(double, 2 * expected)
+
+            net.trace(torch.zeros(1, 1, 3), as_list)
+
+    def test_forward_several_outputs_grad(self, setup_several_outputs):
+        net = setup_several_outputs()
+        net.trace(torch.zeros(1, 1, 3))
+
+        data = torch.randn(5, 1, 3)
+        result, double = net(data)
+        (result.sum() + double.sum()).backward()
+
+        expected = 3 * data[:, 0].sum(dim=0)[:, None].expand(3, 4)
+        assert torch.allclose(net.node.grad, expected)
+
+    def test_forward_several_outputs_reset(self, setup_several_outputs):
+        net = setup_several_outputs()
+        net(torch.randn(5, 1, 3))
+        assert net._contract_outputs is not None
+
+        net.reset()
+        assert net._contract_outputs is None
+        assert net.resultant_nodes == dict()
+
+    def test_forward_several_outputs_error(self):
+        class WrongOutputsTN(tk.TensorNetwork):
+
+            def __init__(self):
+                super().__init__(name='wrong_outputs_tn')
+                self.node = tk.randn(shape=(3,), network=self)
+
+            def contract(self):
+                result = self.node * 2.
+                return result, result.tensor
+
+        net = WrongOutputsTN()
+        with pytest.raises(TypeError):
+            net()
+
     def test_auto_stack(self):
         net = tk.TensorNetwork(name='net')
         net.auto_stack = False
