@@ -694,6 +694,40 @@ class TestTensorOps:  # MARK: TestTensorOps
         with pytest.raises(TypeError):
             _ = 3. * node1
     
+    @pytest.mark.parametrize('operand', ['tensor', 'number'])
+    def test_tensor_ops_with_tensor_in_forward(self, operand):
+
+        class Net(tk.TensorNetwork):
+
+            def __init__(self, other):
+                super().__init__()
+                self.node = tk.randn(shape=(2, 3),
+                                     axes_names=('left', 'right'),
+                                     network=self,
+                                     param_node=True)
+                self.other = other
+
+            def contract(self):
+                result = self.node * self.other
+                result = result / self.other
+                result = result + self.other
+                return result - self.other
+
+        if operand == 'tensor':
+            other = torch.rand(2, 3) + 1.
+        else:
+            other = 2.
+        net = Net(other)
+
+        expected = (net.node.tensor * other / other + other) - other
+        for _ in range(2):
+            assert torch.allclose(net(), expected)
+
+        # Operations are replayed with the same tensor or number
+        net.trace()
+        for _ in range(2):
+            assert torch.allclose(net(), expected)
+
     def test_renormalize(self):
         node1 = tk.randn(shape=(3, 3, 3),
                          axes_names=('left', 'input', 'right'))
