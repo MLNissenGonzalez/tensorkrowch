@@ -314,10 +314,27 @@ after binding to the signature, so that equivalent calls share results.
 Recording non-node arguments for the replay is what every operation already
 does.
 
-One built-in exception is not copied: `mul`, `div`, `add` and `sub` key on
+One built-in exception is not exposed: `mul`, `div`, `add` and `sub` key on
 `(node1,)` when the second operand is a tensor or number, so that one result
-is reused whatever the operand. For a user operation, a tensor argument is
-part of its identity.
+is reused whatever the operand, and they pass that operand to the kernel in
+every call. The private core supports this (`key` and `runtime` in
+`_build_operation`, §4.1). For a user operation, a tensor argument is part
+of its identity.
+
+### One core for built-in and custom operations
+
+`permute`, `tprod`, `mul`, `div`, `add`, `sub`, `renormalize` and `conj` are
+built with the same core as `tk.operation`: each one is its planner. Their
+public functions, cache keys, node names and errors are unchanged. Two
+things follow from sharing the core:
+
+- **One place for the bookkeeping.** Each of these operations used to write
+  `check_first`, `fn_first` and `fn_next` by hand (about 100 lines each).
+  This also removed a bug: `tprod` passed both operands' references to
+  each operand's inverse-memory check, so any traced network using it failed.
+- **One rule for stacks.** The output is a `StackNode` whenever its first
+  axis is the `"stack"` axis. Before, every one of these operations except
+  `renormalize` raised a `ValueError` on a StackNode.
 
 ### Names and redefinition
 
@@ -345,8 +362,10 @@ never in the replay.
 
 | what | where |
 |---|---|
-| decorator | `tensorkrowch/operations.py`: `operation`, section *CUSTOM OPERATIONS* |
-| argument helpers | `_freeze_arg` (lists to tuples), `_operand_nodes` (nodes in arguments, also nested) |
+| core | `_build_operation(name, fn, key=None, runtime=())`, after the `Operation` class: builds `check_first`, `fn_first`, `fn_next` and registers the `Operation` |
+| decorator | `operation`, section *CUSTOM OPERATIONS*: validation, signature binding, the redefinition rules, then `_build_operation` |
+| built-ins built with the core | `permute`, `tprod`, `mul`, `div`, `add`, `sub` (shared `_elementwise_plan`, `_elementwise_key`), `renormalize`, `conj` |
+| argument helpers | `_freeze_arg` (lists to tuples), `_operand_nodes` (nodes in arguments, also nested), `_runtime_values` |
 | built-in names | `_BUILTIN_OPERATIONS`, a snapshot of `TensorNetwork.operations` taken after all built-ins are defined |
 | custom names | `_CUSTOM_OPERATIONS`: name → (module, qualname) |
 | output nodes | `_create_resultant_from_axes(axes, name, network, tensor)` |
@@ -364,14 +383,16 @@ user call: op(node, 'right')
                      nodes[0]._successors[name][args]
     -- not found --> fn_first(*args)
                        same network?; kernel, axes = fn(*args)
-                       validate axes; tensors = kernel(node.tensor, ...)
+                       validate axes; tensors = kernel(node.tensor, ...,
+                                                       *runtime values)
                        validate tensors; children = _create_resultant_from_axes
                        Successor(node_ref, index, child,
                                  hints={'kernel', 'single'})
                        store successor; net._seq_ops.append((name, args))
                        if tracing: record operands in the inverse memory
     -- found -----> fn_next(successor, *args)
-                       tensors = kernel(_direct_get_tensor(ref, index), ...)
+                       tensors = kernel(_direct_get_tensor(ref, index), ...,
+                                        *runtime values)
                        child._direct_set_tensor(tensor) for each child
                        if traced: _check_inverse_memory for each operand
 
@@ -381,7 +402,11 @@ replay in forward:   TensorNetwork.operations[name](*args)
 ```
 
 The planner `fn` runs only inside `fn_first`. The replay calls neither the
-wrapper nor the planner.
+wrapper nor the planner. The check and the stored key use `key(*args)` when
+`key` is given (`mul`, `div`, `add`, `sub`). Runtime values are the arguments
+at the positions in `runtime` that are not nodes (the tensor or number in
+`node * tensor`). Built-ins call the core's `Operation` directly; their
+public functions turn lists of axes into tuples.
 
 ### 4.3 `forward` with several outputs
 
@@ -399,9 +424,11 @@ wrapper nor the planner.
 It creates the resultant node with fresh edges, then replaces the edges of
 inherited axes with `net._remove_edge` and `node._add_edge`, the same way
 `split_edge` does. New axes keep their dangling edges, which `reset` removes
-with the node. With a leading `"stack"` axis it creates a `StackNode` from the
-operands' `StackEdge`s. It raises a `ValueError` if the tensor's number of
-dimensions or the size of an inherited edge does not match.
+with the node. When every axis is inherited, it passes the edges to the
+constructor directly. With a leading `"stack"` axis it creates a
+`StackNode` from the operands' `StackEdge`s. It raises a `ValueError` if the
+tensor's number of dimensions, or the size of an inherited non-batch edge,
+does not match. Batch edges admit any size.
 
 ### 4.5 Tests and measurements
 
@@ -426,17 +453,24 @@ dimensions or the size of an inherited edge does not match.
 - Instrumented: the planner runs once per structure (once at the first call,
   once in `trace`), the kernel on every call. A traced `forward` is the
   replay of `contract_edges` and the custom operation only.
-- Timing (CPU, 4 threads, 100 sites, bond 20, batch 256, traced, medians of
-  two rounds): plain `renormalize` (norm discarded) 17.9 / 57.8 ms
+- `tests/test_operations.py::TestTensorOps::test_tensor_ops_stack`: the eight
+  built-ins on a StackNode give StackNodes whose unbound nodes are the
+  per-node results. `test_tprod_in_forward`: `tprod` in a traced network.
+- Built-ins on the core: `MPS.forward` with `renormalize=True` and
+  `inline_mats=True` (200 `renormalize` and 200 contractions per call),
+  traced, one thread, interleaved rounds: 10.7 ms before and 10.9 ms after,
+  within the ~1 ms noise between rounds.
+- Timing of the log-norm operation (CPU, 4 threads, 100 sites, bond 20,
+  batch 256, traced, medians of two rounds): plain `renormalize` (norm discarded) 17.9 / 57.8 ms
   (inference / forward + backward); custom operation keeping the log-norm
   18.6–18.8 / 58.0–61.2 ms, within noise. The B prototype took
   17.8–17.9 / 58.1–58.3 ms.
 
 ### 4.6 Known issues and possible next steps
 
-- The tensor-like built-ins (`permute`, `tprod`, `mul`, `div`, `add`, `sub`,
-  `renormalize`, `conj`) repeat the bookkeeping the decorator writes once.
-  They could be expressed through the same machinery, keeping their successor
-  keys, which would remove several hundred lines.
+- The node-like built-ins (`split`, `contract_edges`, `merge_edges`,
+  `split_edge`, `stack`, `unbind`, `einsum`) still write their own
+  bookkeeping. They create several nodes with new connected edges, or share
+  memory between nodes, which the core does not describe yet.
 - A shorthand for the common "same axes as the first node" output could be
   added if it proves frequent.
