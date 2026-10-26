@@ -47,6 +47,7 @@ This script contains:
 
 import functools
 import inspect
+import operator
 import types
 from typing import Callable
 from numbers import Number
@@ -143,7 +144,9 @@ def _create_resultant_from_axes(axes: Sequence[Union[Axis, Text]],
     axes_names = []
     for i, axis in enumerate(axes):
         if isinstance(axis, Axis):
-            if tensor.shape[i] != axis._node._shape[axis._num]:
+            # Batch edges admit any size
+            if not axis._batch and \
+                    (tensor.shape[i] != axis._node._shape[axis._num]):
                 raise ValueError(
                     f'Size of dimension {i} of the tensor should be equal to '
                     f'the size of the edge of axis "{axis._name}" in node '
@@ -170,6 +173,15 @@ def _create_resultant_from_axes(axes: Sequence[Union[Axis, Text]],
             edges=[axis._node._edges[axis._num] for axis in axes],
             node1_list=[axis._node1 for axis in axes])
     
+    if all([isinstance(axis, Axis) for axis in axes]):
+        return Node._create_resultant(
+            axes_names=axes_names,
+            name=name,
+            network=network,
+            tensor=tensor,
+            edges=[axis._node._edges[axis._num] for axis in axes],
+            node1_list=[axis._node1 for axis in axes])
+    
     new_node = Node._create_resultant(axes_names=axes_names,
                                       name=name,
                                       network=network,
@@ -183,22 +195,169 @@ def _create_resultant_from_axes(axes: Sequence[Union[Axis, Text]],
     return new_node
 
 
+def _freeze_arg(arg: Any) -> Any:
+    """Turns lists into tuples, so that arguments can be keys of successors."""
+    if isinstance(arg, (list, tuple)):
+        return tuple(map(_freeze_arg, arg))
+    return arg
+
+
+def _operand_nodes(args: Tuple[Any, ...]) -> List[AbstractNode]:
+    """Returns the nodes in the arguments, also inside (nested) tuples."""
+    nodes = []
+    for arg in args:
+        if isinstance(arg, AbstractNode):
+            nodes.append(arg)
+        elif isinstance(arg, tuple):
+            nodes += _operand_nodes(arg)
+    return nodes
+
+
+def _runtime_values(args: Tuple[Any, ...], runtime: Sequence[int]) -> List[Any]:
+    """Returns the arguments at positions ``runtime`` that are not nodes."""
+    return [args[i] for i in runtime if not isinstance(args[i], AbstractNode)]
+
+
+def _build_operation(name: Text,
+                     fn: Callable,
+                     key: Optional[Callable] = None,
+                     runtime: Sequence[int] = ()) -> Operation:
+    """
+    Builds and registers the :class:`Operation` ``name``, for built-in and
+    custom (see :func:`operation`) operations.
+    
+    ``fn(*args)`` is called the first time the operation is performed with
+    some arguments, and returns ``(kernel, axes)``. ``kernel`` receives the
+    tensors of the nodes in ``args`` and returns the tensor(s) of the
+    resultant node(s), whose axes are described by ``axes``. In the next
+    calls, only ``kernel`` is called.
+    
+    The successor is stored in the first node of ``args``, with key
+    ``key(*args)`` (``args`` by default). The arguments at positions
+    ``runtime`` that are not nodes (e.g. a tensor multiplying a node) are not
+    fixed in the first call: their values are passed to ``kernel`` in every
+    call, after the tensors.
+    """
+    def check_first(*args) -> Optional[Successor]:
+        nodes = _operand_nodes(args)
+        if not nodes:
+            raise TypeError(f'Operation "{name}" should receive at least one '
+                            'node')
+        successors = nodes[0]._successors.get(name)
+        if not successors:
+            return None
+        return successors.get(args if key is None else key(*args))
+    
+    def fn_first(*args) -> Union[Node, Tuple[Node, ...]]:
+        nodes = _operand_nodes(args)
+        net = nodes[0]._network
+        for node in nodes[1:]:
+            if node._network != net:
+                raise ValueError('Nodes must be in the same network')
+        
+        result = fn(*args)
+        if not isinstance(result, tuple) or (len(result) != 2) or \
+                not isinstance(result[0], Callable):
+            raise TypeError(f'`fn` of operation "{name}" should return a '
+                            'tuple (kernel, axes), where kernel is callable')
+        kernel, axes = result
+        
+        if not isinstance(axes, Sequence) or isinstance(axes, str):
+            raise TypeError('`axes` returned by `fn` should be a sequence of '
+                            'Axis or str, or a sequence of such sequences')
+        single = all([isinstance(ax, (Axis, str)) for ax in axes])
+        all_axes = [axes] if single else axes
+        for out_axes in all_axes:
+            if not isinstance(out_axes, Sequence) or isinstance(out_axes, str):
+                raise TypeError(
+                    '`axes` returned by `fn` should be a sequence of Axis or '
+                    'str, or a sequence of such sequences')
+            for ax in out_axes:
+                if isinstance(ax, Axis) and \
+                        all([ax._node is not node for node in nodes]):
+                    raise ValueError(
+                        f'Axis "{ax._name}" is not an axis of the nodes '
+                        f'passed to operation "{name}"')
+        
+        tensors = kernel(*[node.tensor for node in nodes],
+                         *_runtime_values(args, runtime))
+        if single:
+            tensors = (tensors,)
+        if not isinstance(tensors, Sequence) or \
+                any([not isinstance(t, Tensor) for t in tensors]):
+            raise TypeError('`kernel` should return a torch.Tensor, or a '
+                            'tuple of torch.Tensor if there are several '
+                            'resultant nodes')
+        if len(tensors) != len(all_axes):
+            raise ValueError(f'`kernel` returned {len(tensors)} tensors, but '
+                             f'`axes` describes {len(all_axes)} nodes')
+        
+        children = [_create_resultant_from_axes(axes=out_axes,
+                                                name=name,
+                                                network=net,
+                                                tensor=tensor)
+                    for out_axes, tensor in zip(all_axes, tensors)]
+        child = children[0] if single else tuple(children)
+        
+        # Create successor
+        successor = Successor(
+            node_ref=tuple(node.node_ref() for node in nodes),
+            index=tuple(node._tensor_info['index'] for node in nodes),
+            child=child,
+            hints={'kernel': kernel, 'single': single})
+        
+        # Add successor to parent
+        successor_key = args if key is None else key(*args)
+        if name in nodes[0]._successors:
+            nodes[0]._successors[name].update({successor_key: successor})
+        else:
+            nodes[0]._successors[name] = {successor_key: successor}
+        
+        # Add operation to list of performed operations of TN
+        net._seq_ops.append((name, args))
+        
+        # Record in inverse_memory while tracing
+        if net._tracing:
+            for node in nodes:
+                node._record_in_inverse_memory()
+        
+        return child
+    
+    def fn_next(successor: Successor, *args) -> Union[Node, Tuple[Node, ...]]:
+        nodes = _operand_nodes(args)
+        tensors = [node._direct_get_tensor(node_ref, index)
+                   for node, node_ref, index in zip(nodes,
+                                                    successor.node_ref,
+                                                    successor.index)]
+        tensors = successor.hints['kernel'](*tensors,
+                                            *_runtime_values(args, runtime))
+        
+        child = successor.child
+        if successor.hints['single']:
+            child._direct_set_tensor(tensors)
+        else:
+            for node, tensor in zip(child, tensors):
+                node._direct_set_tensor(tensor)
+        
+        # Record in inverse_memory while contracting, if network is traced
+        # (to delete memory if possible)
+        if nodes[0]._network._traced:
+            for node, node_ref in zip(nodes, successor.node_ref):
+                node._check_inverse_memory(node_ref)
+        
+        return child
+    
+    return Operation(name, check_first, fn_first, fn_next)
+
+
 ###############################################################################
 #                           TENSOR-LIKE OPERATIONS                            #
 ###############################################################################
 
 #################################   PERMUTE    ################################
 # MARK: permute
-def _check_first_permute(node: AbstractNode,
-                         axes: Sequence[Ax]) -> Optional[Successor]:
-    args = (node, tuple(axes))
-    successors = node._successors.get('permute')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _permute_first(node: AbstractNode, axes: Sequence[Ax]) -> Node:
+def _permute_plan(node: AbstractNode,
+                  axes: Tuple[Ax, ...]) -> Tuple[Callable, List[Axis]]:
     axes_nums = []
     for axis in axes:
         axes_nums.append(node.get_axis_num(axis))
@@ -206,61 +365,12 @@ def _permute_first(node: AbstractNode, axes: Sequence[Ax]) -> Node:
     if not is_permutation(list(range(len(axes_nums))), axes_nums):
         raise ValueError('The provided list of axis is not a permutation of the'
                          ' axes of the node')
-    else:
-        new_node = Node._create_resultant(
-            axes_names=permute_list(node.axes_names, axes_nums),
-            name='permute',
-            network=node._network,
-            tensor=node.tensor.permute(axes_nums),
-            edges=permute_list(node._edges, axes_nums),
-            node1_list=permute_list(node.is_node1(), axes_nums))
-
-    # Create successor
-    net = node._network
-    args = (node, tuple(axes))
-    successor = Successor(node_ref=node.node_ref(),
-                          index=node._tensor_info['index'],
-                          child=new_node,
-                          hints=axes_nums)
-
-    # Add successor to parent
-    if 'permute' in node._successors:
-        node._successors['permute'].update({args: successor})
-    else:
-        node._successors['permute'] = {args: successor}
-
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('permute', args))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node._record_in_inverse_memory()
-
-    return new_node
+    
+    return (lambda tensor: tensor.permute(axes_nums)), \
+        permute_list(node._axes, axes_nums)
 
 
-def _permute_next(successor: Successor,
-                  node: AbstractNode,
-                  axes: Sequence[Ax]) -> Node:
-    # All arguments are mandatory though some might not be used
-    new_tensor = node._direct_get_tensor(successor.node_ref,
-                                         successor.index)
-    new_tensor = new_tensor.permute(successor.hints)
-    child = successor.child
-    child._direct_set_tensor(new_tensor)
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node._network._traced:
-        node._check_inverse_memory(successor.node_ref)
-
-    return child
-
-
-permute_op = Operation('permute',
-                       _check_first_permute,
-                       _permute_first,
-                       _permute_next)
+permute_op = _build_operation('permute', _permute_plan)
 
 
 def permute(node: AbstractNode, axes: Sequence[Ax]) -> Node:
@@ -294,7 +404,7 @@ def permute(node: AbstractNode, axes: Sequence[Ax]) -> Node:
     >>> result.shape
     torch.Size([7, 2, 5])
     """
-    return permute_op(node, axes)
+    return permute_op(node, tuple(axes))
 
 
 permute_node = copy_func(permute)
@@ -414,82 +524,21 @@ AbstractNode.permute_ = permute_node_
 
 ##################################   TPROD    #################################
 # MARK: tprod
-def _check_first_tprod(node1: AbstractNode,
-                       node2: AbstractNode) -> Optional[Successor]:
-    args = (node1, node2)
-    successors = node1._successors.get('tprod')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _tprod_first(node1: AbstractNode, node2: AbstractNode) -> Node:
-    if node1._network != node2._network:
-        raise ValueError('Nodes must be in the same network')
+def _tprod_plan(node1: AbstractNode,
+                node2: AbstractNode) -> Tuple[Callable, List[Axis]]:
     if node2 in node1.neighbours():
         raise ValueError('Tensor product cannot be performed between connected'
                          ' nodes')
-
-    new_tensor = torch.outer(node1.tensor.flatten(),
-                             node2.tensor.flatten()).view(*(list(node1._shape) +
-                                                            list(node2._shape)))
-    new_node = Node._create_resultant(
-        axes_names=node1.axes_names + node2.axes_names,
-        name='tprod',
-        network=node1._network,
-        tensor=new_tensor,
-        edges=node1._edges + node2._edges,
-        node1_list=node1.is_node1() + node2.is_node1())
-
-    # Create successor
-    net = node1._network
-    args = (node1, node2)
-    successor = Successor(node_ref=(node1.node_ref(),
-                                    node2.node_ref()),
-                          index=(node1._tensor_info['index'],
-                                 node2._tensor_info['index']),
-                          child=new_node)
-
-    # Add successor to parent
-    if 'tprod' in node1._successors:
-        node1._successors['tprod'].update({args: successor})
-    else:
-        node1._successors['tprod'] = {args: successor}
-
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('tprod', args))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node1._record_in_inverse_memory()
-        node2._record_in_inverse_memory()
-
-    return new_node
+    
+    def kernel(tensor1, tensor2):
+        return torch.outer(tensor1.flatten(),
+                           tensor2.flatten()).view(*tensor1.shape,
+                                                   *tensor2.shape)
+    
+    return kernel, node1._axes + node2._axes
 
 
-def _tprod_next(successor: Successor,
-                node1: AbstractNode,
-                node2: AbstractNode) -> Node:
-    tensor1 = node1._direct_get_tensor(successor.node_ref[0],
-                                       successor.index[0])
-    tensor2 = node2._direct_get_tensor(successor.node_ref[1],
-                                       successor.index[1])
-    new_tensor = torch.outer(tensor1.flatten(),
-                             tensor2.flatten()).view(*(list(node1._shape) + 
-                                                       list(node2._shape)))
-    child = successor.child
-    child._direct_set_tensor(new_tensor)
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node1._network._traced:
-        node1._check_inverse_memory(successor.node_ref[0])
-        node2._check_inverse_memory(successor.node_ref[1])
-
-    return child
-
-
-tprod_op = Operation('tprod', _check_first_tprod, _tprod_first, _tprod_next)
+tprod_op = _build_operation('tprod', _tprod_plan)
 
 
 def tprod(node1: AbstractNode, node2: AbstractNode) -> Node:
@@ -566,112 +615,34 @@ AbstractNode.__mod__ = tprod_node
 AbstractNode.tprod = tprod_node
 
 
+def _elementwise_plan(fn: Callable) -> Callable:
+    """
+    Plan of ``mul``, ``div``, ``add`` and ``sub``: the result has the axes
+    of ``node1``, and ``node2`` is a node or a tensor or number, which is
+    passed again in every call.
+    """
+    def plan(node1: AbstractNode,
+             node2: Union[AbstractNode, torch.Tensor, Number]) -> Tuple[
+                                                    Callable, List[Axis]]:
+        return fn, node1._axes
+    return plan
+
+
+def _elementwise_key(node1: AbstractNode,
+                     node2: Union[AbstractNode, torch.Tensor, Number]) -> Tuple:
+    # Tensors and numbers are not part of the key: the resultant node is the
+    # same whatever they are
+    if isinstance(node2, AbstractNode):
+        return (node1, node2)
+    return (node1,)
+
+
 ###################################   MUL    ##################################
 # MARK: mul
-def _check_first_mul(node1: AbstractNode,
-                     node2: Union[AbstractNode,
-                                  torch.Tensor,
-                                  Number]) -> Optional[Successor]:
-    if isinstance(node2, AbstractNode):
-        args = (node1, node2)
-    else:
-        args = (node1,)
-    successors = node1._successors.get('mul')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _mul_first(node1: AbstractNode,
-               node2: Union[AbstractNode,
-                            torch.Tensor,
-                            Number]) -> Node:
-    is_node2 = False
-    if isinstance(node2, AbstractNode):
-        is_node2 = True
-        if node1._network != node2._network:
-            raise ValueError('Nodes must be in the same network')
-
-    if is_node2:
-        new_tensor = node1.tensor * node2.tensor
-    else:
-        new_tensor = node1.tensor * node2
-    
-    new_node = Node._create_resultant(axes_names=node1.axes_names,
-                                      name='mul',
-                                      network=node1._network,
-                                      tensor=new_tensor,
-                                      edges=node1._edges,
-                                      node1_list=node1.is_node1())
-
-    # Create successor
-    net = node1._network
-    
-    if is_node2:
-        args = (node1, node2)
-        successor = Successor(node_ref=(node1.node_ref(),
-                                        node2.node_ref()),
-                              index=(node1._tensor_info['index'],
-                                     node2._tensor_info['index']),
-                              child=new_node,
-                              hints=is_node2)
-    else:
-        args = (node1,)
-        successor = Successor(node_ref=(node1.node_ref(),),
-                              index=(node1._tensor_info['index'],),
-                              child=new_node,
-                              hints=is_node2)
-
-    # Add successor to parent
-    if 'mul' in node1._successors:
-        node1._successors['mul'].update({args: successor})
-    else:
-        node1._successors['mul'] = {args: successor}
-
-    # Add operation to list of performed operations of TN. Tensors and
-    # numbers are not part of the key, but are needed to replay the operation
-    net._seq_ops.append(('mul', (node1, node2)))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node1._record_in_inverse_memory()
-        
-        if is_node2:
-            node2._record_in_inverse_memory()
-
-    return new_node
-
-
-def _mul_next(successor: Successor,
-              node1: AbstractNode,
-              node2: Union[AbstractNode,
-                           torch.Tensor,
-                           Number]) -> Node:
-    is_node2 = successor.hints
-    tensor1 = node1._direct_get_tensor(successor.node_ref[0],
-                                       successor.index[0])
-    if is_node2:
-        tensor2 = node2._direct_get_tensor(successor.node_ref[1],
-                                           successor.index[1])
-    else:
-        tensor2 = node2
-    
-    new_tensor = tensor1 * tensor2
-    child = successor.child
-    child._direct_set_tensor(new_tensor)
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node1._network._traced:
-        node1._check_inverse_memory(successor.node_ref[0])
-        
-        if is_node2:
-            node2._check_inverse_memory(successor.node_ref[1])
-    
-    return child
-
-
-mul_op = Operation('mul', _check_first_mul, _mul_first, _mul_next)
+mul_op = _build_operation('mul',
+                          _elementwise_plan(operator.mul),
+                          key=_elementwise_key,
+                          runtime=(1,))
 
 
 def mul(node1: AbstractNode,
@@ -788,110 +759,10 @@ AbstractNode.mul = mul_node
 
 ###################################   DIV    ##################################
 # MARK: div
-def _check_first_div(node1: AbstractNode,
-                     node2: Union[AbstractNode,
-                                  torch.Tensor,
-                                  Number]) -> Optional[Successor]:
-    if isinstance(node2, AbstractNode):
-        args = (node1, node2)
-    else:
-        args = (node1,)
-    successors = node1._successors.get('div')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _div_first(node1: AbstractNode,
-               node2: Union[AbstractNode,
-                            torch.Tensor,
-                            Number]) -> Node:
-    is_node2 = False
-    if isinstance(node2, AbstractNode):
-        is_node2 = True
-        if node1._network != node2._network:
-            raise ValueError('Nodes must be in the same network')
-
-    if is_node2:
-        new_tensor = node1.tensor / node2.tensor
-    else:
-        new_tensor = node1.tensor / node2
-    
-    new_node = Node._create_resultant(axes_names=node1.axes_names,
-                                      name='div',
-                                      network=node1._network,
-                                      tensor=new_tensor,
-                                      edges=node1._edges,
-                                      node1_list=node1.is_node1())
-
-    # Create successor
-    net = node1._network
-    
-    if is_node2:
-        args = (node1, node2)
-        successor = Successor(node_ref=(node1.node_ref(),
-                                        node2.node_ref()),
-                              index=(node1._tensor_info['index'],
-                                     node2._tensor_info['index']),
-                              child=new_node,
-                              hints=is_node2)
-    else:
-        args = (node1,)
-        successor = Successor(node_ref=(node1.node_ref(),),
-                              index=(node1._tensor_info['index'],),
-                              child=new_node,
-                              hints=is_node2)
-
-    # Add successor to parent
-    if 'div' in node1._successors:
-        node1._successors['div'].update({args: successor})
-    else:
-        node1._successors['div'] = {args: successor}
-
-    # Add operation to list of performed operations of TN. Tensors and
-    # numbers are not part of the key, but are needed to replay the operation
-    net._seq_ops.append(('div', (node1, node2)))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node1._record_in_inverse_memory()
-        
-        if is_node2:
-            node2._record_in_inverse_memory()
-
-    return new_node
-
-
-def _div_next(successor: Successor,
-              node1: AbstractNode,
-              node2: Union[AbstractNode,
-                           torch.Tensor,
-                           Number]) -> Node:
-    is_node2 = successor.hints
-    tensor1 = node1._direct_get_tensor(successor.node_ref[0],
-                                       successor.index[0])
-    if is_node2:
-        tensor2 = node2._direct_get_tensor(successor.node_ref[1],
-                                           successor.index[1])
-    else:
-        tensor2 = node2
-    
-    new_tensor = tensor1 / tensor2
-    child = successor.child
-    child._direct_set_tensor(new_tensor)
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node1._network._traced:
-        node1._check_inverse_memory(successor.node_ref[0])
-        
-        if is_node2:
-            node2._check_inverse_memory(successor.node_ref[1])
-    
-    return child
-
-
-div_op = Operation('div', _check_first_div, _div_first, _div_next)
+div_op = _build_operation('div',
+                          _elementwise_plan(operator.truediv),
+                          key=_elementwise_key,
+                          runtime=(1,))
 
 
 def div(node1: AbstractNode,
@@ -1008,110 +879,10 @@ AbstractNode.div = div_node
 
 ###################################   ADD    ##################################
 # MARK: add
-def _check_first_add(node1: AbstractNode,
-                     node2: Union[AbstractNode,
-                                  torch.Tensor,
-                                  Number]) -> Optional[Successor]:
-    if isinstance(node2, AbstractNode):
-        args = (node1, node2)
-    else:
-        args = (node1,)
-    successors = node1._successors.get('add')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _add_first(node1: AbstractNode,
-               node2: Union[AbstractNode,
-                            torch.Tensor,
-                            Number]) -> Node:
-    is_node2 = False
-    if isinstance(node2, AbstractNode):
-        is_node2 = True
-        if node1._network != node2._network:
-            raise ValueError('Nodes must be in the same network')
-
-    if is_node2:
-        new_tensor = node1.tensor + node2.tensor
-    else:
-        new_tensor = node1.tensor + node2
-    
-    new_node = Node._create_resultant(axes_names=node1.axes_names,
-                                      name='add',
-                                      network=node1._network,
-                                      tensor=new_tensor,
-                                      edges=node1._edges,
-                                      node1_list=node1.is_node1())
-
-    # Create successor
-    net = node1._network
-    
-    if is_node2:
-        args = (node1, node2)
-        successor = Successor(node_ref=(node1.node_ref(),
-                                        node2.node_ref()),
-                              index=(node1._tensor_info['index'],
-                                     node2._tensor_info['index']),
-                              child=new_node,
-                              hints=is_node2)
-    else:
-        args = (node1,)
-        successor = Successor(node_ref=(node1.node_ref(),),
-                              index=(node1._tensor_info['index'],),
-                              child=new_node,
-                              hints=is_node2)
-
-    # Add successor to parent
-    if 'add' in node1._successors:
-        node1._successors['add'].update({args: successor})
-    else:
-        node1._successors['add'] = {args: successor}
-
-    # Add operation to list of performed operations of TN. Tensors and
-    # numbers are not part of the key, but are needed to replay the operation
-    net._seq_ops.append(('add', (node1, node2)))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node1._record_in_inverse_memory()
-        
-        if is_node2:
-            node2._record_in_inverse_memory()
-
-    return new_node
-
-
-def _add_next(successor: Successor,
-              node1: AbstractNode,
-              node2: Union[AbstractNode,
-                           torch.Tensor,
-                           Number]) -> Node:
-    is_node2 = successor.hints
-    tensor1 = node1._direct_get_tensor(successor.node_ref[0],
-                                       successor.index[0])
-    if is_node2:
-        tensor2 = node2._direct_get_tensor(successor.node_ref[1],
-                                           successor.index[1])
-    else:
-        tensor2 = node2
-    
-    new_tensor = tensor1 + tensor2
-    child = successor.child
-    child._direct_set_tensor(new_tensor)
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node1._network._traced:
-        node1._check_inverse_memory(successor.node_ref[0])
-        
-        if is_node2:
-            node2._check_inverse_memory(successor.node_ref[1])
-
-    return child
-
-
-add_op = Operation('add', _check_first_add, _add_first, _add_next)
+add_op = _build_operation('add',
+                          _elementwise_plan(operator.add),
+                          key=_elementwise_key,
+                          runtime=(1,))
 
 
 def add(node1: AbstractNode,
@@ -1228,110 +999,10 @@ AbstractNode.add = add_node
 
 ###################################   SUB    ##################################
 # MARK: sub
-def _check_first_sub(node1: AbstractNode,
-                     node2: Union[AbstractNode,
-                                  torch.Tensor,
-                                  Number]) -> Optional[Successor]:
-    if isinstance(node2, AbstractNode):
-        args = (node1, node2)
-    else:
-        args = (node1,)
-    successors = node1._successors.get('sub')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _sub_first(node1: AbstractNode,
-               node2: Union[AbstractNode,
-                            torch.Tensor,
-                            Number]) -> Node:
-    is_node2 = False
-    if isinstance(node2, AbstractNode):
-        is_node2 = True
-        if node1._network != node2._network:
-            raise ValueError('Nodes must be in the same network')
-
-    if is_node2:
-        new_tensor = node1.tensor - node2.tensor
-    else:
-        new_tensor = node1.tensor - node2
-    
-    new_node = Node._create_resultant(axes_names=node1.axes_names,
-                                      name='sub',
-                                      network=node1._network,
-                                      tensor=new_tensor,
-                                      edges=node1._edges,
-                                      node1_list=node1.is_node1())
-
-    # Create successor
-    net = node1._network
-    
-    if is_node2:
-        args = (node1, node2)
-        successor = Successor(node_ref=(node1.node_ref(),
-                                        node2.node_ref()),
-                              index=(node1._tensor_info['index'],
-                                     node2._tensor_info['index']),
-                              child=new_node,
-                              hints=is_node2)
-    else:
-        args = (node1,)
-        successor = Successor(node_ref=(node1.node_ref(),),
-                              index=(node1._tensor_info['index'],),
-                              child=new_node,
-                              hints=is_node2)
-
-    # Add successor to parent
-    if 'sub' in node1._successors:
-        node1._successors['sub'].update({args: successor})
-    else:
-        node1._successors['sub'] = {args: successor}
-
-    # Add operation to list of performed operations of TN. Tensors and
-    # numbers are not part of the key, but are needed to replay the operation
-    net._seq_ops.append(('sub', (node1, node2)))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node1._record_in_inverse_memory()
-        
-        if is_node2:
-            node2._record_in_inverse_memory()
-
-    return new_node
-
-
-def _sub_next(successor: Successor,
-              node1: AbstractNode,
-              node2: Union[AbstractNode,
-                           torch.Tensor,
-                           Number]) -> Node:
-    is_node2 = successor.hints
-    tensor1 = node1._direct_get_tensor(successor.node_ref[0],
-                                       successor.index[0])
-    if is_node2:
-        tensor2 = node2._direct_get_tensor(successor.node_ref[1],
-                                           successor.index[1])
-    else:
-        tensor2 = node2
-    
-    new_tensor = tensor1 - tensor2
-    child = successor.child
-    child._direct_set_tensor(new_tensor)
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node1._network._traced:
-        node1._check_inverse_memory(successor.node_ref[0])
-        
-        if is_node2:
-            node2._check_inverse_memory(successor.node_ref[1])
-
-    return child
-
-
-sub_op = Operation('sub', _check_first_sub, _sub_first, _sub_next)
+sub_op = _build_operation('sub',
+                          _elementwise_plan(operator.sub),
+                          key=_elementwise_key,
+                          runtime=(1,))
 
 
 def sub(node1: AbstractNode,
@@ -1448,105 +1119,28 @@ AbstractNode.sub = sub_node
 
 ###############################   renormalize    ##############################
 # MARK: renormalize
-def _check_first_renormalize(
+def _renormalize_plan(
     node: AbstractNode,
-    p: Union[int, float] = 2,
-    axis: Optional[Union[Ax, Sequence[Ax]]] = None) -> Optional[Successor]:
-    
-    if isinstance(axis, (tuple, list)):
-        axis = tuple(axis)
-    args = (node, p, axis)
-    successors = node._successors.get('renormalize')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _renormalize_first(
-    node: AbstractNode,
-    p: Union[int, float] = 2,
-    axis: Optional[Union[Ax, Sequence[Ax]]] = None) -> Node:
+    p: Union[int, float],
+    axis: Optional[Union[Ax, Tuple[Ax, ...]]]) -> Tuple[Callable, List[Axis]]:
     
     axis_num = []
     if axis is not None:
-        if isinstance(axis, (tuple, list)):
+        if isinstance(axis, tuple):
             for ax in axis:
                 axis_num.append(node.get_axis_num(ax))
-            axis = tuple(axis)
         else:
             axis_num.append(node.get_axis_num(axis))
     
-    norm = node.tensor.norm(p=p, dim=axis_num, keepdim=True)
-    norm = torch.where(norm == 0., 1., norm)
-    new_tensor = node.tensor / norm
+    def kernel(tensor):
+        norm = tensor.norm(p=p, dim=axis_num, keepdim=True)
+        norm = torch.where(norm == 0., 1., norm)
+        return tensor / norm
     
-    if isinstance(node, (StackNode, ParamStackNode)):
-        new_node = StackNode._create_resultant(axes_names=node.axes_names,
-                                               name='renormalize',
-                                               network=node._network,
-                                               tensor=new_tensor,
-                                               edges=node._edges,
-                                               node1_list=node.is_node1())
-    else:
-        new_node = Node._create_resultant(axes_names=node.axes_names,
-                                          name='renormalize',
-                                          network=node._network,
-                                          tensor=new_tensor,
-                                          edges=node._edges,
-                                          node1_list=node.is_node1())
-    
-    # Create successor
-    net = node._network
-    args = (node, p, axis)
-    successor = Successor(node_ref=node.node_ref(),
-                          index=node._tensor_info['index'],
-                          child=new_node,
-                          hints=axis_num)
-
-    # Add successor to parent
-    if 'renormalize' in node._successors:
-        node._successors['renormalize'].update({args: successor})
-    else:
-        node._successors['renormalize'] = {args: successor}
-
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('renormalize', args))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node._record_in_inverse_memory()
-
-    return new_node
+    return kernel, node._axes
 
 
-def _renormalize_next(
-    successor: Successor,
-    node: AbstractNode,
-    p: Union[int, float] = 2,
-    axis: Optional[Union[Ax, Sequence[Ax]]] = None) -> Node:
-    
-    axis_num = successor.hints
-    tensor = node._direct_get_tensor(successor.node_ref,
-                                     successor.index)
-    norm = tensor.norm(p=p, dim=axis_num, keepdim=True)
-    norm = torch.where(norm == 0., 1., norm)
-    new_tensor = tensor / norm
-    
-    child = successor.child
-    child._direct_set_tensor(new_tensor)
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node._network._traced:
-        node._check_inverse_memory(successor.node_ref)
-    
-    return child
-
-
-renormalize_op = Operation('renormalize',
-                           _check_first_renormalize,
-                           _renormalize_first,
-                           _renormalize_next)
+renormalize_op = _build_operation('renormalize', _renormalize_plan)
 
 
 def renormalize(
@@ -1582,6 +1176,8 @@ def renormalize(
     >>> renormA.norm()
     tensor(1.)
     """
+    if isinstance(axis, list):
+        axis = tuple(axis)
     return renormalize_op(node, p, axis)
 
 
@@ -1620,63 +1216,8 @@ AbstractNode.renormalize = renormalize_node
 
 ##################################   conj    ##################################
 # MARK: conj
-def _check_first_conj(node: AbstractNode) -> Optional[Successor]:
-    args = (node,)
-    successors = node._successors.get('conj')
-    if not successors:
-        return None
-    return successors.get(args)
-
-
-def _conj_first(node: AbstractNode) -> Node:
-    new_node = Node._create_resultant(axes_names=node.axes_names,
-                                      name='conj',
-                                      network=node._network,
-                                      tensor=node.tensor.conj(),
-                                      edges=node._edges,
-                                      node1_list=node.is_node1())
-    
-    # Create successor
-    net = node._network
-    args = (node,)
-    successor = Successor(node_ref=node.node_ref(),
-                          index=node._tensor_info['index'],
-                          child=new_node)
-
-    # Add successor to parent
-    if 'conj' in node._successors:
-        node._successors['conj'].update({args: successor})
-    else:
-        node._successors['conj'] = {args: successor}
-
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('conj', args))
-
-    # Record in inverse_memory while tracing
-    if net._tracing:
-        node._record_in_inverse_memory()
-
-    return new_node
-
-
-def _conj_next(successor: Successor, node: AbstractNode) -> Node:
-    tensor = node._direct_get_tensor(successor.node_ref,
-                                     successor.index)
-    child = successor.child
-    child._direct_set_tensor(tensor.conj())
-
-    # Record in inverse_memory while contracting, if network is traced
-    # (to delete memory if possible)
-    if node._network._traced:
-        node._check_inverse_memory(successor.node_ref)
-    
-    return child
-
-
-conj_op = Operation('conj',
-                    _check_first_conj,
-                    _conj_first,
-                    _conj_next)
+conj_op = _build_operation(
+    'conj', lambda node: ((lambda tensor: tensor.conj()), node._axes))
 
 
 def conj(node: AbstractNode) -> Node:
@@ -7175,24 +6716,6 @@ _BUILTIN_OPERATIONS = frozenset(TensorNetwork.operations)
 _CUSTOM_OPERATIONS = dict()  # Name -> (module, qualname) of the function
 
 
-def _freeze_arg(arg: Any) -> Any:
-    """Turns lists into tuples, so that arguments can be keys of successors."""
-    if isinstance(arg, (list, tuple)):
-        return tuple(map(_freeze_arg, arg))
-    return arg
-
-
-def _operand_nodes(args: Tuple[Any, ...]) -> List[AbstractNode]:
-    """Returns the nodes in the arguments, also inside (nested) tuples."""
-    nodes = []
-    for arg in args:
-        if isinstance(arg, AbstractNode):
-            nodes.append(arg)
-        elif isinstance(arg, tuple):
-            nodes += _operand_nodes(arg)
-    return nodes
-
-
 def operation(fn: Optional[Callable] = None,
               *,
               name: Optional[Text] = None) -> Callable:
@@ -7321,114 +6844,11 @@ def operation(fn: Optional[Callable] = None,
                 if param.kind == param.KEYWORD_ONLY]
     n_positional = len(parameters) - len(kw_names)
     
-    def check_first(*args) -> Optional[Successor]:
-        nodes = _operand_nodes(args)
-        if not nodes:
-            raise TypeError(f'Operation "{name}" should receive at least one '
-                            'node')
-        successors = nodes[0]._successors.get(name)
-        if not successors:
-            return None
-        return successors.get(args)
+    def plan(*args) -> Tuple[Callable, Sequence]:
+        return fn(*args[:n_positional],
+                  **dict(zip(kw_names, args[n_positional:])))
     
-    def fn_first(*args) -> Union[Node, Tuple[Node, ...]]:
-        nodes = _operand_nodes(args)
-        net = nodes[0]._network
-        for node in nodes[1:]:
-            if node._network != net:
-                raise ValueError('Nodes must be in the same network')
-        
-        result = fn(*args[:n_positional],
-                    **dict(zip(kw_names, args[n_positional:])))
-        if not isinstance(result, tuple) or (len(result) != 2) or \
-                not isinstance(result[0], Callable):
-            raise TypeError(f'`fn` of operation "{name}" should return a '
-                            'tuple (kernel, axes), where kernel is callable')
-        kernel, axes = result
-        
-        if not isinstance(axes, Sequence) or isinstance(axes, str):
-            raise TypeError('`axes` returned by `fn` should be a sequence of '
-                            'Axis or str, or a sequence of such sequences')
-        single = all([isinstance(ax, (Axis, str)) for ax in axes])
-        all_axes = [axes] if single else axes
-        for out_axes in all_axes:
-            if not isinstance(out_axes, Sequence) or isinstance(out_axes, str):
-                raise TypeError(
-                    '`axes` returned by `fn` should be a sequence of Axis or '
-                    'str, or a sequence of such sequences')
-            for ax in out_axes:
-                if isinstance(ax, Axis) and \
-                        all([ax._node is not node for node in nodes]):
-                    raise ValueError(
-                        f'Axis "{ax._name}" is not an axis of the nodes '
-                        f'passed to operation "{name}"')
-        
-        tensors = kernel(*[node.tensor for node in nodes])
-        if single:
-            tensors = (tensors,)
-        if not isinstance(tensors, Sequence) or \
-                any([not isinstance(t, Tensor) for t in tensors]):
-            raise TypeError('`kernel` should return a torch.Tensor, or a '
-                            'tuple of torch.Tensor if there are several '
-                            'resultant nodes')
-        if len(tensors) != len(all_axes):
-            raise ValueError(f'`kernel` returned {len(tensors)} tensors, but '
-                             f'`axes` describes {len(all_axes)} nodes')
-        
-        children = [_create_resultant_from_axes(axes=out_axes,
-                                                name=name,
-                                                network=net,
-                                                tensor=tensor)
-                    for out_axes, tensor in zip(all_axes, tensors)]
-        child = children[0] if single else tuple(children)
-        
-        # Create successor
-        successor = Successor(
-            node_ref=tuple(node.node_ref() for node in nodes),
-            index=tuple(node._tensor_info['index'] for node in nodes),
-            child=child,
-            hints={'kernel': kernel, 'single': single})
-        
-        # Add successor to parent
-        if name in nodes[0]._successors:
-            nodes[0]._successors[name].update({args: successor})
-        else:
-            nodes[0]._successors[name] = {args: successor}
-        
-        # Add operation to list of performed operations of TN
-        net._seq_ops.append((name, args))
-        
-        # Record in inverse_memory while tracing
-        if net._tracing:
-            for node in nodes:
-                node._record_in_inverse_memory()
-        
-        return child
-    
-    def fn_next(successor: Successor, *args) -> Union[Node, Tuple[Node, ...]]:
-        nodes = _operand_nodes(args)
-        tensors = [node._direct_get_tensor(node_ref, index)
-                   for node, node_ref, index in zip(nodes,
-                                                    successor.node_ref,
-                                                    successor.index)]
-        tensors = successor.hints['kernel'](*tensors)
-        
-        child = successor.child
-        if successor.hints['single']:
-            child._direct_set_tensor(tensors)
-        else:
-            for node, tensor in zip(child, tensors):
-                node._direct_set_tensor(tensor)
-        
-        # Record in inverse_memory while contracting, if network is traced
-        # (to delete memory if possible)
-        if nodes[0]._network._traced:
-            for node, node_ref in zip(nodes, successor.node_ref):
-                node._check_inverse_memory(node_ref)
-        
-        return child
-    
-    custom_op = Operation(name, check_first, fn_first, fn_next)
+    custom_op = _build_operation(name, plan)
     _CUSTOM_OPERATIONS[name] = origin
     
     @functools.wraps(fn)
