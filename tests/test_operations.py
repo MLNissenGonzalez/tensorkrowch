@@ -5458,7 +5458,7 @@ class TestStackUnbind:  # MARK: TestStackUnbind
         all_index = list(range(1, len(nodes), 2)) + even_index
         restack_all = tk.stack(unbound[1::2] + reunbound)
         self._assert_stack_info(restack_all, tk.StackNode, None, stack)
-        assert restack_all._tensor_info['index'] == [all_index]
+        assert restack_all._tensor_info['index'] == (all_index,)
 
         reunbound_all = tk.unbind(restack_all)
         self._assert_nodes_match(

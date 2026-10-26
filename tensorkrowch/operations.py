@@ -6362,7 +6362,8 @@ def _stack_first(nodes: Sequence[AbstractNode]) -> StackNode:
                     index.append(slice(0, None))
                 else:
                     index.append(slice(max_dim - dim, max_dim))
-        stack_node._tensor_info['index'] = index
+        # One index per dimension. A list would be read as a tensor index
+        stack_node._tensor_info['index'] = tuple(index)
 
     else:
         if all_leaf and (all_param or all_non_param) \
@@ -6382,7 +6383,7 @@ def _stack_first(nodes: Sequence[AbstractNode]) -> StackNode:
                         index.append(slice(0, None))
                     else:
                         index.append(slice(max_dim - dim, max_dim))
-                node._tensor_info['index'] = index
+                node._tensor_info['index'] = tuple(index)
 
                 if all_param:
                     delattr(net, 'param_' + node._name)
@@ -6568,7 +6569,7 @@ def _unbind_first(node: AbstractStackNode) -> List[Node]:
                     index.append(slice(0, None))
                 else:  #dim >= edge.size():
                     index.append(slice(dim - edge.size(), dim))
-            lst_crops.append(index)
+            lst_crops.append(tuple(index))
 
     if not net._auto_unbind:
         # Record in inverse_memory while tracing
@@ -6631,6 +6632,8 @@ def _unbind_first(node: AbstractStackNode) -> List[Node]:
 
             if len(index) == 1:
                 index = index[0]
+            else:
+                index = tuple(index)
             new_node._tensor_info['index'] = index
 
     # Create successor

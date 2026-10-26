@@ -64,3 +64,10 @@ packages = [
 [project.urls]
 GitHub = "https://github.com/joserapa98/tensorkrowch"
 Documentation = "https://joserapa98.github.io/tensorkrowch"
+
+[tool.pytest.ini_options]
+# A list as a multidimensional index is read as a tensor index by newer
+# PyTorch versions; node tensors must be indexed with tuples
+filterwarnings = [
+    "error:Using a non-tuple sequence for multidimensional indexing:UserWarning",
+]
