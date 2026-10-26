@@ -564,8 +564,9 @@ def _mul_first(node1: AbstractNode,
     else:
         node1._successors['mul'] = {args: successor}
 
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('mul', args))
+    # Add operation to list of performed operations of TN. Tensors and
+    # numbers are not part of the key, but are needed to replay the operation
+    net._seq_ops.append(('mul', (node1, node2)))
 
     # Record in inverse_memory while tracing
     if net._tracing:
@@ -783,8 +784,9 @@ def _div_first(node1: AbstractNode,
     else:
         node1._successors['div'] = {args: successor}
 
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('div', args))
+    # Add operation to list of performed operations of TN. Tensors and
+    # numbers are not part of the key, but are needed to replay the operation
+    net._seq_ops.append(('div', (node1, node2)))
 
     # Record in inverse_memory while tracing
     if net._tracing:
@@ -1002,8 +1004,9 @@ def _add_first(node1: AbstractNode,
     else:
         node1._successors['add'] = {args: successor}
 
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('add', args))
+    # Add operation to list of performed operations of TN. Tensors and
+    # numbers are not part of the key, but are needed to replay the operation
+    net._seq_ops.append(('add', (node1, node2)))
 
     # Record in inverse_memory while tracing
     if net._tracing:
@@ -1221,8 +1224,9 @@ def _sub_first(node1: AbstractNode,
     else:
         node1._successors['sub'] = {args: successor}
 
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('sub', args))
+    # Add operation to list of performed operations of TN. Tensors and
+    # numbers are not part of the key, but are needed to replay the operation
+    net._seq_ops.append(('sub', (node1, node2)))
 
     # Record in inverse_memory while tracing
     if net._tracing:
