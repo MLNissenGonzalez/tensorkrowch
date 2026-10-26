@@ -1881,7 +1881,7 @@ class TestMPS:  # MARK: TestMPS
             dense = torch.tensordot(dense, tensor, dims=([-1], [0]))
         dense = torch.diagonal(dense, dim1=0, dim2=-1).sum(-1)
 
-        out_features = [i for i in range(mps.n_features)
+        out_features = [i for i in range(mps.n_sites)
                         if i not in in_features]
         dense = dense.permute(in_features + out_features)
         dense = dense.reshape(5 ** len(in_features), -1)
