@@ -30,7 +30,7 @@ from tensorkrowch.operations import (svd, svd_, svdr, svdr_, qr, qr_, rq, rq_,
                                      contract, contract_)
 
 # Node operations
-from tensorkrowch.operations import Operation
+from tensorkrowch.operations import Operation, operation
 from tensorkrowch.operations import get_shared_edges  # Not in docs
 
 from tensorkrowch.operations import (permute, permute_, tprod, mul, div, add,

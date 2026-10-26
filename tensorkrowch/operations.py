@@ -40,8 +40,13 @@ This script contains:
         * unbind
         * einsum
         * stacked_einsum
+    
+    Custom operations:
+        * operation          (decorator)
 """
 
+import functools
+import inspect
 import types
 from typing import Callable
 from numbers import Number
@@ -50,8 +55,9 @@ from itertools import starmap
 import opt_einsum
 
 from tensorkrowch.components import *
-from tensorkrowch.utils import (inverse_permutation, is_permutation,
-                                list2slice, permute_list, truncated_svd)
+from tensorkrowch.utils import (check_name_style, inverse_permutation,
+                                is_permutation, list2slice, permute_list,
+                                truncated_svd)
 
 
 def copy_func(f):
@@ -7151,3 +7157,289 @@ def stacked_einsum(string: Text,
     result = einsum(string, *stacks_list)
     unbound_result = unbind(result)
     return unbound_result
+
+
+###############################################################################
+#                              CUSTOM OPERATIONS                              #
+###############################################################################
+
+# MARK: operation
+_BUILTIN_OPERATIONS = frozenset(TensorNetwork.operations)
+_CUSTOM_OPERATIONS = dict()  # Name -> (module, qualname) of the function
+
+
+def _freeze_arg(arg: Any) -> Any:
+    """Turns lists into tuples, so that arguments can be keys of successors."""
+    if isinstance(arg, (list, tuple)):
+        return tuple(map(_freeze_arg, arg))
+    return arg
+
+
+def _operand_nodes(args: Tuple[Any, ...]) -> List[AbstractNode]:
+    """Returns the nodes in the arguments, also inside (nested) tuples."""
+    nodes = []
+    for arg in args:
+        if isinstance(arg, AbstractNode):
+            nodes.append(arg)
+        elif isinstance(arg, tuple):
+            nodes += _operand_nodes(arg)
+    return nodes
+
+
+def operation(fn: Optional[Callable] = None,
+              *,
+              name: Optional[Text] = None) -> Callable:
+    r"""
+    Decorator that turns a function into a node :class:`Operation`, so that
+    users can define their own operations and these are traced as the rest of
+    operations: in the next calls to :meth:`~TensorNetwork.forward` only their
+    tensor computations are performed (see :meth:`~TensorNetwork.trace`).
+    
+    The decorated function ``fn`` receives nodes, and possibly other arguments,
+    and returns a tuple ``(kernel, axes)``:
+    
+    * ``kernel`` is a function that receives the tensors of all the nodes
+      passed to ``fn`` (in the same order, also nodes inside lists or tuples)
+      and returns the tensor of the resultant node, or a tuple of tensors if
+      there are several resultant nodes. It can be any **PyTorch** code.
+    
+    * ``axes`` describes the axes of the resultant node: a sequence where each
+      element is either an :class:`Axis` of one of the nodes passed to ``fn``,
+      whose name and edge are kept, or a ``str``, the name of a new axis with
+      a new dangling edge. For several resultant nodes, ``axes`` is a sequence
+      of such sequences, one for each node. If the first axis is the
+      ``"stack"`` axis of a (Param)StackNode, the resultant node is a
+      :class:`StackNode`, and all its axes should come from (Param)StackNodes.
+    
+    ``fn`` is only called the first time the operation is performed. Hence,
+    everything that is the same in every call (e.g. finding the numbers of
+    axes) can be computed in ``fn``, before defining ``kernel``. In the next
+    calls with the same arguments, only ``kernel`` is called, with the new
+    tensors of the nodes, and the tensors of the resultant nodes are replaced.
+    Arguments other than nodes are recorded in the first call, and the same
+    objects are used in the next calls. Thus, they should be hashable (lists
+    are turned into tuples).
+    
+    The operation is registered with ``name`` in
+    :attr:`TensorNetwork.operations`, and its resultant nodes take that name.
+    It cannot be the name of a built-in operation, and leaf nodes cannot be
+    named as the operation. A name can be defined again by the same function
+    (e.g. running again the code that defines it), and then only the function
+    returned by the last definition can be called.
+    
+    Parameters
+    ----------
+    fn : callable
+        Function that receives at least one node and returns
+        ``(kernel, axes)``. It cannot have ``*args`` or ``**kwargs``
+        parameters.
+    name : str, optional
+        Name of the operation. By default, it is the name of ``fn``.
+    
+    Returns
+    -------
+    callable
+        Function with the same parameters as ``fn``, returning the resultant
+        node, or tuple of resultant nodes.
+    
+    Examples
+    --------
+    An operation that renormalizes a node and also returns its norm in log
+    scale. Norms are accumulated while contracting, and then returned by
+    :meth:`~TensorNetwork.contract` together with the result.
+    
+    >>> @tk.operation
+    ... def renormalize_log(node, axis):
+    ...     axis_num = node.get_axis_num(axis)
+    ...     other_axes = [ax for ax in node.axes if ax.num != axis_num]
+    ...
+    ...     def kernel(tensor):
+    ...         norm = tensor.norm(dim=axis_num, keepdim=True)
+    ...         return tensor / norm, norm.log().squeeze(axis_num)
+    ...
+    ...     return kernel, (node.axes, other_axes)
+    ...
+    >>> nodeA = tk.randn((2, 3), axes_names=('batch', 'right'))
+    >>> renormA, log_normA = renormalize_log(nodeA, 'right')
+    >>> renormA.name, log_normA.name
+    ('renormalize_log_0', 'renormalize_log_1')
+    
+    >>> log_normA.axes_names
+    ['batch']
+    
+    >>> recovered = renormA.tensor * log_normA.tensor.exp()[:, None]
+    >>> torch.allclose(recovered, nodeA.tensor)
+    True
+    
+    The resultant nodes are cached as in any other operation:
+    
+    >>> renormalize_log(nodeA, axis='right')[0] is renormA
+    True
+    """
+    if fn is None:
+        return functools.partial(operation, name=name)
+    
+    if not isinstance(fn, Callable):
+        raise TypeError('`fn` should be callable')
+    
+    if name is None:
+        name = getattr(fn, '__name__', None)
+        if name is None:
+            raise TypeError('`name` should be given if `fn` has no __name__')
+    elif not isinstance(name, str):
+        raise TypeError('`name` should be str type')
+    if not check_name_style(name, 'node'):
+        raise ValueError('Names cannot contain blank spaces')
+    if name in _BUILTIN_OPERATIONS:
+        raise ValueError(f'Name "{name}" is already the name of a built-in '
+                         'operation')
+    
+    # Operations can be redefined (e.g. running a cell again), but functions
+    # from different places cannot share a name, since they would share cached
+    # resultant nodes. Functions of previous definitions cannot be used anymore
+    origin = (getattr(fn, '__module__', None), getattr(fn, '__qualname__', None))
+    if _CUSTOM_OPERATIONS.get(name, origin) != origin:
+        raise ValueError(f'Name "{name}" is already the name of an operation '
+                         f'defined in {_CUSTOM_OPERATIONS[name][0]}. Use '
+                         '`name` to give another name to the operation')
+    
+    signature = inspect.signature(fn)
+    parameters = list(signature.parameters.values())
+    if any([param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
+            for param in parameters]):
+        raise TypeError('`fn` cannot have *args or **kwargs parameters')
+    
+    # Recorded arguments are positional, keyword-only arguments go last
+    kw_names = [param.name for param in parameters
+                if param.kind == param.KEYWORD_ONLY]
+    n_positional = len(parameters) - len(kw_names)
+    
+    def check_first(*args) -> Optional[Successor]:
+        nodes = _operand_nodes(args)
+        if not nodes:
+            raise TypeError(f'Operation "{name}" should receive at least one '
+                            'node')
+        successors = nodes[0]._successors.get(name)
+        if not successors:
+            return None
+        return successors.get(args)
+    
+    def fn_first(*args) -> Union[Node, Tuple[Node, ...]]:
+        nodes = _operand_nodes(args)
+        net = nodes[0]._network
+        for node in nodes[1:]:
+            if node._network != net:
+                raise ValueError('Nodes must be in the same network')
+        
+        result = fn(*args[:n_positional],
+                    **dict(zip(kw_names, args[n_positional:])))
+        if not isinstance(result, tuple) or (len(result) != 2) or \
+                not isinstance(result[0], Callable):
+            raise TypeError(f'`fn` of operation "{name}" should return a '
+                            'tuple (kernel, axes), where kernel is callable')
+        kernel, axes = result
+        
+        if not isinstance(axes, Sequence) or isinstance(axes, str):
+            raise TypeError('`axes` returned by `fn` should be a sequence of '
+                            'Axis or str, or a sequence of such sequences')
+        single = all([isinstance(ax, (Axis, str)) for ax in axes])
+        all_axes = [axes] if single else axes
+        for out_axes in all_axes:
+            if not isinstance(out_axes, Sequence) or isinstance(out_axes, str):
+                raise TypeError(
+                    '`axes` returned by `fn` should be a sequence of Axis or '
+                    'str, or a sequence of such sequences')
+            for ax in out_axes:
+                if isinstance(ax, Axis) and \
+                        all([ax._node is not node for node in nodes]):
+                    raise ValueError(
+                        f'Axis "{ax._name}" is not an axis of the nodes '
+                        f'passed to operation "{name}"')
+        
+        tensors = kernel(*[node.tensor for node in nodes])
+        if single:
+            tensors = (tensors,)
+        if not isinstance(tensors, Sequence) or \
+                any([not isinstance(t, Tensor) for t in tensors]):
+            raise TypeError('`kernel` should return a torch.Tensor, or a '
+                            'tuple of torch.Tensor if there are several '
+                            'resultant nodes')
+        if len(tensors) != len(all_axes):
+            raise ValueError(f'`kernel` returned {len(tensors)} tensors, but '
+                             f'`axes` describes {len(all_axes)} nodes')
+        
+        children = [_create_resultant_from_axes(axes=out_axes,
+                                                name=name,
+                                                network=net,
+                                                tensor=tensor)
+                    for out_axes, tensor in zip(all_axes, tensors)]
+        child = children[0] if single else tuple(children)
+        
+        # Create successor
+        successor = Successor(
+            node_ref=tuple(node.node_ref() for node in nodes),
+            index=tuple(node._tensor_info['index'] for node in nodes),
+            child=child,
+            hints={'kernel': kernel, 'single': single})
+        
+        # Add successor to parent
+        if name in nodes[0]._successors:
+            nodes[0]._successors[name].update({args: successor})
+        else:
+            nodes[0]._successors[name] = {args: successor}
+        
+        # Add operation to list of performed operations of TN
+        net._seq_ops.append((name, args))
+        
+        # Record in inverse_memory while tracing
+        if net._tracing:
+            for node in nodes:
+                node._record_in_inverse_memory()
+        
+        return child
+    
+    def fn_next(successor: Successor, *args) -> Union[Node, Tuple[Node, ...]]:
+        nodes = _operand_nodes(args)
+        tensors = [node._direct_get_tensor(node_ref, index)
+                   for node, node_ref, index in zip(nodes,
+                                                    successor.node_ref,
+                                                    successor.index)]
+        tensors = successor.hints['kernel'](*tensors)
+        
+        child = successor.child
+        if successor.hints['single']:
+            child._direct_set_tensor(tensors)
+        else:
+            for node, tensor in zip(child, tensors):
+                node._direct_set_tensor(tensor)
+        
+        # Record in inverse_memory while contracting, if network is traced
+        # (to delete memory if possible)
+        if nodes[0]._network._traced:
+            for node, node_ref in zip(nodes, successor.node_ref):
+                node._check_inverse_memory(node_ref)
+        
+        return child
+    
+    custom_op = Operation(name, check_first, fn_first, fn_next)
+    _CUSTOM_OPERATIONS[name] = origin
+    
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if TensorNetwork.operations.get(name) is not custom_op:
+            raise ValueError(f'Operation "{name}" has been defined again, '
+                             'use the function of the last definition')
+        
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        args = tuple(_freeze_arg(bound.arguments[param.name])
+                     for param in parameters)
+        try:
+            hash(args)
+        except TypeError:
+            raise TypeError(f'Arguments of operation "{name}" should be nodes '
+                            'or hashable objects (lists are turned into '
+                            'tuples)')
+        return custom_op(*args)
+    
+    return wrapper
