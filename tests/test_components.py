@@ -448,6 +448,19 @@ class TestNodeName:  # MARK: TestNodeName
         # Names of operations cannot be used as names of leaf nodes
         with pytest.raises(ValueError):
             node1.name = 'contract_edges'
+        assert node1.name == 'node1'
+
+    @pytest.mark.parametrize('name', ['contract_edges', 'renormalize_3'])
+    def test_new_node_with_operation_name(self, setup, name):
+        net = setup
+        names = list(net.nodes.keys())
+
+        # Also when the node is created
+        with pytest.raises(ValueError):
+            tk.Node(shape=(2, 3), name=name, network=net)
+        with pytest.raises(ValueError):
+            tk.randn(shape=(2, 3), name=name)
+        assert list(net.nodes.keys()) == names
 
     def test_name_resultant(self, setup):
         net = setup

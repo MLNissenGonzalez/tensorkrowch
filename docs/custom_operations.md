@@ -211,7 +211,7 @@ def project(node, matrix, axis):
   nodes take that name, and are enumerated (`name_0`, `name_1`) when there
   are several outputs.
 - The name cannot be the name of a built-in operation, and leaf nodes cannot
-  be renamed to it.
+  be given that name (`ValueError`).
 - Defining the same function again (re-running a notebook cell) is allowed.
   After that, only the newest definition can be called: an older one raises a
   `ValueError`. This also covers factories that define several operations
@@ -434,10 +434,6 @@ dimensions or the size of an inherited edge does not match.
 
 ### 4.6 Known issues and possible next steps
 
-- Creating a leaf node whose name is an operation name (built-in or custom),
-  e.g. `tk.randn((2,), name='renormalize')`, raises a `RecursionError` in
-  `TensorNetwork._assign_node_name` instead of its `ValueError`. Renaming a
-  node raises the `ValueError` correctly. This predates this change.
 - The tensor-like built-ins (`permute`, `tprod`, `mul`, `div`, `add`, `sub`,
   `renormalize`, `conj`) repeat the bookkeeping the decorator writes once.
   They could be expressed through the same machinery, keeping their successor

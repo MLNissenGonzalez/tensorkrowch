@@ -4495,7 +4495,9 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         non_enum_prev_name = erase_enum(name)
 
         if not node.is_resultant() and (non_enum_prev_name in self.operations):
-            self._assign_node_name(node, node._name)
+            if not first_time:
+                # When renaming, the previous name has been unassigned
+                self._assign_node_name(node, node._name)
             raise ValueError(f'Node\'s name cannot be an operation name: '
                              f'{list(self.operations.keys())}')
 
