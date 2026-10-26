@@ -2852,6 +2852,17 @@ class TestMPS:  # MARK: TestMPS
 
         self._finalize_mps_canonicalize(mps, n_features)
 
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
+    @pytest.mark.parametrize('renormalize', AUTO_BOOL_CASES)
+    def test_entropy_with_underflowing_schmidt_values(self, dtype, renormalize):
+        # Schmidt values (1, 1e-30): the square of the second one is 0 in
+        # single precision, and its term p log p is 0, not 0 * log(0)
+        tensor = torch.diag(torch.tensor([1., 1e-30])).to(dtype)
+        mps = tk.models.MPS(tensors=[tensor, torch.eye(2, dtype=dtype)],
+                            boundary='obc')
+        entropy = mps.entropy(middle_site=0, renormalize=renormalize)
+        assert torch.isclose(entropy, torch.tensor(0.), atol=1e-6)
+
     @pytest.mark.parametrize('runtime', RUNTIME_CASES)
     @pytest.mark.parametrize('n_features,boundary,middle_site', ENTROPY_CASES)
     def test_entropy_preserves_mixed_parameterization(self,

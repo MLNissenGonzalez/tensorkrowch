@@ -1880,7 +1880,10 @@ class MPS(TensorNetwork):  # MARK: MPS
             full_matrices=False)
         
         s /= s.norm()
-        s2 = s[s > 0].pow(2)
+        # Squares of tiny singular values may underflow to 0, and terms
+        # p log p vanish as p -> 0
+        s2 = s.pow(2)
+        s2 = s2[s2 > 0]
         entropy = -(s2 * s2.log()).sum()
         
         # Rescale
