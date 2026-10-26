@@ -189,6 +189,8 @@ def _runtime_kwargs(runtime, device):
         return {'device': device}
     if runtime == 'complex':
         return {'dtype': torch.complex64}
+    if runtime == 'double':
+        return {'dtype': torch.float64}
     return {}
 
 
@@ -3025,9 +3027,11 @@ class TestMPS:  # MARK: TestMPS
 
     @pytest.mark.parametrize('n_features', UNIVOCAL_N_FEATURES_CASES)
     def test_canonicalize_univocal_diff_dims(self, n_features):
+        # In float32, the error of some random MPS reaches 1e-3 (relative):
+        # float64 checks that the canonical form is exact
         phys_dim = torch.arange(2, 2 + n_features).int().tolist()
         bond_dim = torch.arange(2, 1 + n_features).int().tolist()
-        self._run_univocal_case(n_features, 'default', phys_dim, bond_dim, 1e-4)
+        self._run_univocal_case(n_features, 'double', phys_dim, bond_dim, 1e-10)
 
     @pytest.mark.parametrize('n_features', UNIVOCAL_N_FEATURES_CASES)
     def test_canonicalize_univocal_bond_greater_than_phys(self, n_features):
