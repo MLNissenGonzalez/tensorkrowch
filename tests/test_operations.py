@@ -694,6 +694,50 @@ class TestTensorOps:  # MARK: TestTensorOps
         with pytest.raises(TypeError):
             _ = 3. * node1
     
+    def test_tensor_ops_stack(self):
+        net = tk.TensorNetwork()
+        nodes = [tk.randn(shape=(2, 3),
+                          axes_names=('left', 'right'),
+                          network=net,
+                          dtype=torch.complex64)
+                 for _ in range(4)]
+        others = [tk.randn(shape=(2, 3),
+                           axes_names=('left', 'right'),
+                           network=net,
+                           dtype=torch.complex64)
+                  for _ in range(4)]
+        stack = tk.stack(nodes)
+        other_stack = tk.stack(others)
+        tensor = torch.randn(4, 2, 3, dtype=torch.complex64)
+        
+        # Results keep the "stack" axis, so they are StackNodes. Each one is
+        # checked before the next operation, since ``stack * 2.`` and
+        # ``stack * tensor`` share their resultant node
+        cases = [
+            (lambda: stack * 2., lambda t, o, i: t * 2.),
+            (lambda: stack * tensor, lambda t, o, i: t * tensor[i]),
+            (lambda: stack * other_stack, lambda t, o, i: t * o),
+            (lambda: stack / other_stack, lambda t, o, i: t / o),
+            (lambda: stack + other_stack, lambda t, o, i: t + o),
+            (lambda: stack - 1., lambda t, o, i: t - 1.),
+            (lambda: stack.conj(), lambda t, o, i: t.conj()),
+            (lambda: stack.renormalize(axis='right'),
+             lambda t, o, i: t / t.norm(dim=1, keepdim=True)),
+            (lambda: stack.permute(('stack', 'right', 'left')),
+             lambda t, o, i: t.permute(1, 0)),
+        ]
+        for operation, expected in cases:
+            result = operation()
+            assert isinstance(result, tk.StackNode)
+            for i, (unbound, node, other) in enumerate(
+                    zip(tk.unbind(result), nodes, others)):
+                assert torch.allclose(unbound.tensor,
+                                      expected(node.tensor, other.tensor, i))
+        
+        # The "stack" axis can only be the first one
+        with pytest.raises(ValueError):
+            stack.permute(('left', 'stack', 'right'))
+    
     @pytest.mark.parametrize('then_mul', [True, False])
     def test_tprod_in_forward(self, then_mul):
         
