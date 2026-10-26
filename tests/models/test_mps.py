@@ -4104,6 +4104,37 @@ class TestConvModels:  # MARK: TestConvModels
         
 
 
+
+class RenormalizeLogNormMPS(tk.models.MPS):
+    """
+    MPS whose contraction renormalizes the result after each site and
+    accumulates the norms in log scale, with :func:`renormalize`.
+    """
+    
+    def contract(self):
+        mats_env = self._input_contraction(
+            nodes_env=self.in_env,
+            input_nodes=[node.neighbours('input') for node in self.in_env])
+        
+        result = self._left_node
+        log_norm = None
+        for node in mats_env:
+            result @= node
+            result, log_n = result.renormalize(axis='right',
+                                               return_norm=True,
+                                               log_scale=True)
+            if log_norm is None:
+                log_norm = log_n
+            else:
+                log_norm = log_norm + log_n
+        result @= self._right_node
+        
+        return result, log_norm
+
+
+class TestRenormalizeLogNormMPS(LogNormMPSChecks):  # MARK: TestRenormalizeLogNormMPS
+    mps_class = RenormalizeLogNormMPS
+
 # TODO: test if I have 2 nodes from 2 networks, and set a.tensor = b.tensor,
 # the tensor is not copied, they are sharing the same tensor. If it is a Parameter,
 # I can compute gradients with respect to 1 node but update both

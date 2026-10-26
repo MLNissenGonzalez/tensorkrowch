@@ -1445,11 +1445,13 @@ AbstractNode.sub = sub_node
 def _check_first_renormalize(
     node: AbstractNode,
     p: Union[int, float] = 2,
-    axis: Optional[Union[Ax, Sequence[Ax]]] = None) -> Optional[Successor]:
+    axis: Optional[Union[Ax, Sequence[Ax]]] = None,
+    return_norm: bool = False,
+    log_scale: bool = False) -> Optional[Successor]:
     
     if isinstance(axis, (tuple, list)):
         axis = tuple(axis)
-    args = (node, p, axis)
+    args = (node, p, axis, return_norm, log_scale)
     successors = node._successors.get('renormalize')
     if not successors:
         return None
@@ -1459,7 +1461,12 @@ def _check_first_renormalize(
 def _renormalize_first(
     node: AbstractNode,
     p: Union[int, float] = 2,
-    axis: Optional[Union[Ax, Sequence[Ax]]] = None) -> Node:
+    axis: Optional[Union[Ax, Sequence[Ax]]] = None,
+    return_norm: bool = False,
+    log_scale: bool = False) -> Union[Node, Tuple[Node, Node]]:
+    
+    if log_scale and not return_norm:
+        raise ValueError('`log_scale` can only be True if `return_norm` is True')
     
     axis_num = []
     if axis is not None:
@@ -1489,13 +1496,31 @@ def _renormalize_first(
                                           edges=node._edges,
                                           node1_list=node.is_node1())
     
+    # The norm keeps the axes that are not reduced (none if ``axis`` is None)
+    keep_num = []
+    if axis_num:
+        keep_num = [i for i in range(node.ndim) if i not in axis_num]
+    
+    child = new_node
+    if return_norm:
+        norm = norm.reshape([norm.shape[i] for i in keep_num])
+        if log_scale:
+            norm = norm.log()
+        norm_node = _create_resultant_from_axes(
+            axes=[node._axes[i] for i in keep_num],
+            name='renormalize',
+            network=node._network,
+            tensor=norm)
+        child = (new_node, norm_node)
+    
     # Create successor
     net = node._network
-    args = (node, p, axis)
+    args = (node, p, axis, return_norm, log_scale)
     successor = Successor(node_ref=node.node_ref(),
                           index=node._tensor_info['index'],
-                          child=new_node,
-                          hints=axis_num)
+                          child=child,
+                          hints={'axis_num': axis_num,
+                                 'keep_num': keep_num})
 
     # Add successor to parent
     if 'renormalize' in node._successors:
@@ -1510,24 +1535,34 @@ def _renormalize_first(
     if net._tracing:
         node._record_in_inverse_memory()
 
-    return new_node
+    return child
 
 
 def _renormalize_next(
     successor: Successor,
     node: AbstractNode,
     p: Union[int, float] = 2,
-    axis: Optional[Union[Ax, Sequence[Ax]]] = None) -> Node:
+    axis: Optional[Union[Ax, Sequence[Ax]]] = None,
+    return_norm: bool = False,
+    log_scale: bool = False) -> Union[Node, Tuple[Node, Node]]:
     
-    axis_num = successor.hints
+    hints = successor.hints
     tensor = node._direct_get_tensor(successor.node_ref,
                                      successor.index)
-    norm = tensor.norm(p=p, dim=axis_num, keepdim=True)
+    norm = tensor.norm(p=p, dim=hints['axis_num'], keepdim=True)
     norm = torch.where(norm == 0., 1., norm)
     new_tensor = tensor / norm
     
     child = successor.child
-    child._direct_set_tensor(new_tensor)
+    if return_norm:
+        child[0]._direct_set_tensor(new_tensor)
+        
+        norm = norm.reshape([norm.shape[i] for i in hints['keep_num']])
+        if log_scale:
+            norm = norm.log()
+        child[1]._direct_set_tensor(norm)
+    else:
+        child._direct_set_tensor(new_tensor)
 
     # Record in inverse_memory while contracting, if network is traced
     # (to delete memory if possible)
@@ -1546,13 +1581,28 @@ renormalize_op = Operation('renormalize',
 def renormalize(
     node: AbstractNode,
     p: Union[int, float] = 2,
-    axis: Optional[Union[Ax, Sequence[Ax]]] = None) -> Node:
+    axis: Optional[Union[Ax, Sequence[Ax]]] = None,
+    return_norm: bool = False,
+    log_scale: bool = False) -> Union[Node, Tuple[Node, Node]]:
     """
     Normalizes the node with the specified norm. That is, the tensor of ``node``
     is divided by its norm.
     
     Different norms can be taken, specifying the argument ``p``, and accross
     different dimensions, or node axes, specifying the argument ``axis``.
+    
+    If ``return_norm = True``, the norm that divides the tensor is also
+    returned, in a node that keeps the axes of ``node`` that are not reduced
+    (a node with no axes if ``axis`` is None). Norms equal to 0 are replaced by
+    1, so that ``node`` is always the product of both resultant nodes. With
+    ``log_scale = True``, the norm node stores the logarithm of the norm.
+    
+    This allows renormalizing intermediate nodes while contracting a
+    :class:`TensorNetwork`, to avoid that the result explodes or vanishes,
+    without losing its scale: the log-norms can be accumulated with
+    :func:`add` and returned by :meth:`~TensorNetwork.contract` together with
+    the result, and they will be computed in every call to
+    :meth:`~TensorNetwork.forward`, also after :meth:`~TensorNetwork.trace`.
     
     See also `torch.norm() <https://pytorch.org/docs/stable/generated/torch.norm.html>`_.
 
@@ -1564,10 +1614,15 @@ def renormalize(
         The order of the norm.
     axis : int, str, Axis or list[int, str or Axis], optional
         Axis or sequence of axes over which to reduce.
+    return_norm : bool
+        Boolean indicating whether the norm is also returned, in a node.
+    log_scale : bool
+        Boolean indicating whether the returned norm is given in logarithmic
+        scale. It can only be ``True`` if ``return_norm`` is ``True``.
 
     Returns
     -------
-    Node
+    Node or tuple[Node, Node]
     
     Examples
     --------
@@ -1575,8 +1630,20 @@ def renormalize(
     >>> renormA = tk.renormalize(nodeA)
     >>> renormA.norm()
     tensor(1.)
+    
+    >>> nodeA = tk.randn((2, 3), axes_names=('batch', 'right'))
+    >>> renormA, log_normA = tk.renormalize(nodeA,
+    ...                                     axis='right',
+    ...                                     return_norm=True,
+    ...                                     log_scale=True)
+    >>> log_normA.axes_names
+    ['batch']
+    
+    >>> recovered = renormA.tensor * log_normA.tensor.exp()[:, None]
+    >>> torch.allclose(recovered, nodeA.tensor)
+    True
     """
-    return renormalize_op(node, p, axis)
+    return renormalize_op(node, p, axis, return_norm, log_scale)
 
 
 renormalize_node = copy_func(renormalize)
@@ -1588,6 +1655,19 @@ renormalize_node.__doc__ = \
     Different norms can be taken, specifying the argument ``p``, and accross
     different dimensions, or node axes, specifying the argument ``axis``.
     
+    If ``return_norm = True``, the norm that divides the tensor is also
+    returned, in a node that keeps the axes of ``node`` that are not reduced
+    (a node with no axes if ``axis`` is None). Norms equal to 0 are replaced by
+    1, so that ``node`` is always the product of both resultant nodes. With
+    ``log_scale = True``, the norm node stores the logarithm of the norm.
+    
+    This allows renormalizing intermediate nodes while contracting a
+    :class:`TensorNetwork`, to avoid that the result explodes or vanishes,
+    without losing its scale: the log-norms can be accumulated with
+    :func:`add` and returned by :meth:`~TensorNetwork.contract` together with
+    the result, and they will be computed in every call to
+    :meth:`~TensorNetwork.forward`, also after :meth:`~TensorNetwork.trace`.
+    
     See also `torch.norm() <https://pytorch.org/docs/stable/generated/torch.norm.html>`_.
 
     Parameters
@@ -1596,10 +1676,15 @@ renormalize_node.__doc__ = \
         The order of the norm.
     axis : int, str, Axis or list[int, str or Axis], optional
         Axis or sequence of axes over which to reduce.
+    return_norm : bool
+        Boolean indicating whether the norm is also returned, in a node.
+    log_scale : bool
+        Boolean indicating whether the returned norm is given in logarithmic
+        scale. It can only be ``True`` if ``return_norm`` is ``True``.
 
     Returns
     -------
-    Node
+    Node or tuple[Node, Node]
     
     Examples
     --------
@@ -1607,6 +1692,11 @@ renormalize_node.__doc__ = \
     >>> renormA = nodeA.renormalize()
     >>> renormA.norm()
     tensor(1.)
+    
+    >>> nodeA = tk.randn((2, 3), axes_names=('batch', 'right'))
+    >>> renormA, normA = nodeA.renormalize(axis='right', return_norm=True)
+    >>> normA.shape
+    torch.Size([2])
     """
 
 AbstractNode.renormalize = renormalize_node
