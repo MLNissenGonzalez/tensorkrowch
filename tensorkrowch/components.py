@@ -4101,6 +4101,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         # Lis of operations used to contract the TN
         self._seq_ops = []
         self._contract_args = None
+        self._contract_outputs = None  # Nodes returned by contract, if several
 
     # ----------
     # Properties
@@ -4951,6 +4952,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         self._traced = False
         self._seq_ops = []
         self._contract_args = None
+        self._contract_outputs = None
         self._inverse_memory = dict()
 
         if self._resultant_nodes or self._virtual_nodes:
@@ -5060,11 +5062,15 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         bound.apply_defaults()
         return dict(bound.arguments)
 
-    def contract(self) -> Node:
+    def contract(self) -> Union[Node, Tuple[Node, ...]]:
         """
         Contracts the whole tensor network returning a single :class:`Node`.
         This method is not implemented and subclasses of :class:`TensorNetwork`
         should override it to define the contraction algorithm of the network.
+        
+        It can also return a tuple of nodes, for instance the result of the
+        contraction and a node with the norms extracted while contracting.
+        Then, :meth:`forward` returns a tuple with their tensors.
         """
         # Custom, optimized contraction methods should be defined for each new
         # subclass of TensorNetwork
@@ -5092,6 +5098,11 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         Hence, the **last operation** in :meth:`contract` should be the one that
         **returns the single output** :class:`Node`.
         
+        If :meth:`contract` returns a tuple of nodes instead, ``forward``
+        returns a tuple with their tensors, and these nodes can come from any
+        operation. Their tensors are not erased from memory after the
+        contraction, even if they are used in later operations.
+        
         For an example, check this :ref:`tutorial <tutorial_5>`.
 
         Parameters
@@ -5117,6 +5128,10 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
             Arguments that might be used in :meth:`contract`.
         kwargs :
             Keyword arguments that might be used in :meth:`contract`.
+        
+        Returns
+        -------
+        torch.Tensor or tuple[torch.Tensor]
         """
         if data is not None:
             if not self._data_nodes:
@@ -5133,7 +5148,23 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         if not self._resultant_nodes:
             self._contract_args = self._normalize_contract_args(*args, **kwargs)
             output = self.contract(*args, **kwargs)
-            return output.tensor
+            if not isinstance(output, (tuple, list)):
+                return output.tensor
+            
+            if not output or \
+                    any([not isinstance(node, AbstractNode) for node in output]):
+                raise TypeError('`contract` should return a node or a tuple '
+                                'of nodes')
+            self._contract_outputs = tuple(output)
+            
+            # Outputs cannot be erased when re-accessed in later operations
+            if self._tracing:
+                for node in self._contract_outputs:
+                    address = node.tensor_address()
+                    if address in self._inverse_memory:
+                        self._inverse_memory[address]['erase'] = False
+            
+            return tuple(node.tensor for node in self._contract_outputs)
 
         else:
             contract_args = self._normalize_contract_args(*args, **kwargs)
@@ -5147,6 +5178,9 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
 
             output = list(map(lambda op: self.operations[op[0]](*op[1]),
                               self._seq_ops))[-1]
+            
+            if self._contract_outputs is not None:
+                return tuple(node.tensor for node in self._contract_outputs)
 
             if not isinstance(output, Node):
                 if (self._seq_ops[-1][0] == 'unbind') and (len(output) == 1):

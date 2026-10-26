@@ -38,6 +38,102 @@ STACK_AUTO_CASES = [
 ]
 
 
+class TestResultantFromAxes:  # MARK: TestResultantFromAxes
+    
+    @pytest.fixture
+    def setup(self):
+        net = tk.TensorNetwork()
+        node1 = tk.randn(shape=(2, 3, 4),
+                         axes_names=('batch', 'left', 'right'),
+                         name='node1',
+                         network=net)
+        node2 = tk.randn(shape=(4, 5),
+                         axes_names=('left', 'right'),
+                         name='node2',
+                         network=net)
+        node1['right'] ^ node2['left']
+        return net, node1, node2
+    
+    def test_inherited_and_new_axes(self, setup):
+        net, node1, node2 = setup
+        edges = net.edges[:]
+        
+        new_node = tk.operations._create_resultant_from_axes(
+            axes=[node1['batch'].axis1, node1['right'].axis1, 'new'],
+            name='custom',
+            network=net,
+            tensor=torch.randn(2, 4, 6))
+        assert new_node.is_resultant()
+        assert new_node.axes_names == ['batch', 'right', 'new']
+        assert new_node['batch'] is node1['batch']
+        assert new_node['right'] is node1['right']
+        assert new_node.neighbours('right') is node2
+        assert new_node['new'].is_dangling()
+        assert new_node['new'].is_attached_to(new_node)
+        
+        net.reset()
+        assert net.resultant_nodes == dict()
+        assert net.edges == edges
+        assert node1.neighbours('right') is node2
+    
+    def test_no_axes(self, setup):
+        net, _, _ = setup
+        new_node = tk.operations._create_resultant_from_axes(
+            axes=[], name='custom', network=net, tensor=torch.tensor(2.))
+        assert new_node.shape == ()
+    
+    def test_stack_axes(self, setup):
+        net, _, _ = setup
+        nodes = [tk.randn(shape=(3, 4),
+                          axes_names=('left', 'right'),
+                          network=net)
+                 for _ in range(5)]
+        stack_node = tk.stack(nodes)
+        
+        new_node = tk.operations._create_resultant_from_axes(
+            axes=[stack_node['stack'].axis1, stack_node['left'].axis1],
+            name='custom',
+            network=net,
+            tensor=torch.randn(5, 3))
+        assert isinstance(new_node, tk.StackNode)
+        assert new_node.axes_names == ['stack', 'left']
+        
+        # The rest of axes should come from (Param)StackNodes
+        with pytest.raises(ValueError):
+            tk.operations._create_resultant_from_axes(
+                axes=[stack_node['stack'].axis1, 'new'],
+                name='custom',
+                network=net,
+                tensor=torch.randn(5, 3))
+    
+    def test_errors(self, setup):
+        net, node1, _ = setup
+        
+        # Wrong number of dimensions
+        with pytest.raises(ValueError):
+            tk.operations._create_resultant_from_axes(
+                axes=[node1['batch'].axis1],
+                name='custom',
+                network=net,
+                tensor=torch.randn(2, 3))
+        
+        # Size of inherited edge changed
+        with pytest.raises(ValueError):
+            tk.operations._create_resultant_from_axes(
+                axes=[node1['left'].axis1],
+                name='custom',
+                network=net,
+                tensor=torch.randn(7))
+        
+        # Wrong type of axis
+        with pytest.raises(TypeError):
+            tk.operations._create_resultant_from_axes(
+                axes=[0],
+                name='custom',
+                network=net,
+                tensor=torch.randn(2))
+
+
 class TestPermute:  # MARK: TestPermute
 
     def test_permute_top_level(self):
