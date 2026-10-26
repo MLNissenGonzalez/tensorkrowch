@@ -694,6 +694,40 @@ class TestTensorOps:  # MARK: TestTensorOps
         with pytest.raises(TypeError):
             _ = 3. * node1
     
+    @pytest.mark.parametrize('then_mul', [True, False])
+    def test_tprod_in_forward(self, then_mul):
+        
+        class Net(tk.TensorNetwork):
+            
+            def __init__(self):
+                super().__init__()
+                self.node1 = tk.randn(shape=(2,),
+                                      axes_names=('left',),
+                                      network=self,
+                                      param_node=True)
+                self.node2 = tk.randn(shape=(3,),
+                                      axes_names=('right',),
+                                      network=self,
+                                      param_node=True)
+            
+            def contract(self):
+                result = self.node1 % self.node2
+                if then_mul:
+                    # Reads the result of tprod, which can be erased
+                    result = result * 2.
+                return result
+        
+        net = Net()
+        expected = torch.outer(net.node1.tensor, net.node2.tensor)
+        if then_mul:
+            expected = expected * 2.
+        
+        for _ in range(2):
+            assert torch.allclose(net(), expected)
+        net.trace()
+        for _ in range(2):
+            assert torch.allclose(net(), expected)
+    
     @pytest.mark.parametrize('operand', ['tensor', 'number'])
     def test_tensor_ops_with_tensor_in_forward(self, operand):
 

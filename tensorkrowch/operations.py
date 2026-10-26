@@ -483,8 +483,8 @@ def _tprod_next(successor: Successor,
     # Record in inverse_memory while contracting, if network is traced
     # (to delete memory if possible)
     if node1._network._traced:
-        node1._check_inverse_memory(successor.node_ref)
-        node2._check_inverse_memory(successor.node_ref)
+        node1._check_inverse_memory(successor.node_ref[0])
+        node2._check_inverse_memory(successor.node_ref[1])
 
     return child
 
