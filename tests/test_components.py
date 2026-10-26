@@ -3371,6 +3371,40 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
 
         assert not result.norm().isclose(torch.tensor(1.))
 
+    def test_reset_virtual_node_operand(self):
+        class VirtualOperandTN(tk.TensorNetwork):
+
+            def __init__(self):
+                super().__init__(name='virtual_operand_tn')
+                # Virtual nodes not named "virtual_result" are kept by reset
+                self.aux = tk.randn(shape=(3, 4),
+                                    axes_names=('left', 'right'),
+                                    name='aux',
+                                    network=self,
+                                    virtual=True)
+                self.node = tk.randn(shape=(4, 5),
+                                     axes_names=('left', 'right'),
+                                     name='node',
+                                     network=self,
+                                     param_node=True)
+                self.aux['right'] ^ self.node['left']
+
+            def contract(self):
+                return self.aux @ self.node
+        
+        net = VirtualOperandTN()
+        expected = net.aux.tensor @ net.node.tensor
+        assert torch.allclose(net(), expected)
+        
+        # Successors of the virtual node pointed to deleted resultant nodes
+        net.reset()
+        assert net.aux.successors == dict()
+        assert torch.allclose(net(), expected)
+        
+        net.trace()
+        for _ in range(2):
+            assert torch.allclose(net(), expected)
+    
     @pytest.fixture
     def setup_several_outputs(self):
         class SeveralOutputsTN(tk.TensorNetwork):
