@@ -7,6 +7,7 @@ Tests for mps:
     * TestUMPSLayer
     * TestMPSData
     * TestConvModels
+    * TestOperationLogNormMPS (LogNormMPSChecks)
 """
 
 import itertools
@@ -298,6 +299,133 @@ def _assert_mps_data_node_shapes(mps, n_batches, batch_size):
     for node in mps.mats_env:
         assert node.shape == tuple([batch_size] * n_batches + [5, 2, 5])
 
+
+
+class LogNormMPSChecks:  # MARK: LogNormMPSChecks
+    """
+    Checks for MPS models whose ``contract`` renormalizes the result after
+    each site and returns it together with the accumulated log-norms, so that
+    long MPS do not overflow. ``Test...`` subclasses set ``mps_class``.
+    """
+    
+    mps_class = None
+    
+    @staticmethod
+    def _reference(mps, dtype):
+        return tk.models.MPS(
+            tensors=[node.tensor.detach().to(dtype) for node in mps.mats_env],
+            boundary='obc')
+    
+    @pytest.mark.parametrize('auto_stack', [True, False])
+    def test_log_norm_matches_mps(self, auto_stack):
+        mps = self.mps_class(n_features=30,
+                             phys_dim=2,
+                             bond_dim=5,
+                             boundary='obc',
+                             init_method='randn',
+                             std=1.,
+                             dtype=torch.float64)
+        mps.auto_stack = auto_stack
+        ref = self._reference(mps, torch.float64)
+        
+        for batch_size in [1, 7]:
+            data = torch.randn(batch_size, 30, 2, dtype=torch.float64)
+            expected = ref(data).abs().log()
+            
+            for _ in range(2):
+                result, log_norm = mps(data)
+                assert log_norm.shape == (batch_size,)
+                assert torch.allclose(result.abs().log() + log_norm, expected)
+            
+            mps.trace(torch.zeros(1, 30, 2, dtype=torch.float64))
+            for _ in range(2):
+                result, log_norm = mps(data)
+                assert torch.allclose(result.abs().log() + log_norm, expected)
+            mps.reset()
+    
+    def test_log_norm_avoids_overflow(self):
+        mps = self.mps_class(n_features=200,
+                             phys_dim=2,
+                             bond_dim=5,
+                             boundary='obc',
+                             init_method='randn',
+                             std=1.)
+        data = torch.randn(4, 200, 2)
+        
+        # In float32, amplitudes overflow, but their logarithms do not
+        assert not self._reference(mps, torch.float32)(data).isfinite().all()
+        expected = self._reference(mps, torch.float64)(data.double())
+        expected = expected.abs().log()
+        assert (expected > 88.8).any()  # log of max float32
+        
+        mps.trace(torch.zeros(1, 200, 2))
+        result, log_norm = mps(data)
+        assert result.isfinite().all()
+        assert torch.allclose((result.abs().log() + log_norm).double(),
+                              expected,
+                              rtol=1e-4)
+    
+    def test_log_norm_grad(self):
+        mps = self.mps_class(n_features=20,
+                             phys_dim=2,
+                             bond_dim=5,
+                             boundary='obc',
+                             init_method='randn',
+                             std=1.,
+                             dtype=torch.float64)
+        data = torch.randn(7, 20, 2, dtype=torch.float64)
+        
+        mps.trace(torch.zeros(1, 20, 2, dtype=torch.float64))
+        result, log_norm = mps(data)
+        (result.abs().log() + log_norm).sum().backward()
+        
+        ref = self._reference(mps, torch.float64)
+        ref(data).abs().log().sum().backward()
+        
+        for node, ref_node in zip(mps.mats_env, ref.mats_env):
+            assert torch.allclose(node.grad, ref_node.grad)
+
+
+@tk.operation
+def renormalize_log_mps_test_op(node, axis):
+    axis_num = node.get_axis_num(axis)
+    other_axes = [ax for ax in node.axes if ax.num != axis_num]
+    
+    def kernel(tensor):
+        norm = tensor.norm(dim=axis_num, keepdim=True)
+        norm = torch.where(norm == 0., 1., norm)
+        return tensor / norm, norm.log().squeeze(axis_num)
+    
+    return kernel, (node.axes, other_axes)
+
+
+class OperationLogNormMPS(tk.models.MPS):
+    """
+    MPS whose contraction renormalizes the result after each site and
+    accumulates the norms in log scale, with a custom :func:`operation`.
+    """
+    
+    def contract(self):
+        mats_env = self._input_contraction(
+            nodes_env=self.in_env,
+            input_nodes=[node.neighbours('input') for node in self.in_env])
+        
+        result = self._left_node
+        log_norm = None
+        for node in mats_env:
+            result @= node
+            result, log_n = renormalize_log_mps_test_op(result, 'right')
+            if log_norm is None:
+                log_norm = log_n
+            else:
+                log_norm = log_norm + log_n
+        result @= self._right_node
+        
+        return result, log_norm
+
+
+class TestOperationLogNormMPS(LogNormMPSChecks):  # MARK: TestOperationLogNormMPS
+    mps_class = OperationLogNormMPS
 
 class TestMPS:  # MARK: TestMPS
 

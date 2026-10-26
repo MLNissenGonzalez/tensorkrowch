@@ -16,6 +16,7 @@ This script contains tests for operations:
     * TestMergeSplitEdge
     * TestStackUnbind
     * TestEinsum
+    * TestCustomOperation
     * TestTNModels
 """
 
@@ -36,6 +37,102 @@ STACK_AUTO_CASES = [
     (True, True),
     (False, True),
 ]
+
+
+class TestResultantFromAxes:  # MARK: TestResultantFromAxes
+    
+    @pytest.fixture
+    def setup(self):
+        net = tk.TensorNetwork()
+        node1 = tk.randn(shape=(2, 3, 4),
+                         axes_names=('batch', 'left', 'right'),
+                         name='node1',
+                         network=net)
+        node2 = tk.randn(shape=(4, 5),
+                         axes_names=('left', 'right'),
+                         name='node2',
+                         network=net)
+        node1['right'] ^ node2['left']
+        return net, node1, node2
+    
+    def test_inherited_and_new_axes(self, setup):
+        net, node1, node2 = setup
+        edges = net.edges[:]
+        
+        new_node = tk.operations._create_resultant_from_axes(
+            axes=[node1['batch'].axis1, node1['right'].axis1, 'new'],
+            name='custom',
+            network=net,
+            tensor=torch.randn(2, 4, 6))
+        assert new_node.is_resultant()
+        assert new_node.axes_names == ['batch', 'right', 'new']
+        assert new_node['batch'] is node1['batch']
+        assert new_node['right'] is node1['right']
+        assert new_node.neighbours('right') is node2
+        assert new_node['new'].is_dangling()
+        assert new_node['new'].is_attached_to(new_node)
+        
+        net.reset()
+        assert net.resultant_nodes == dict()
+        assert net.edges == edges
+        assert node1.neighbours('right') is node2
+    
+    def test_no_axes(self, setup):
+        net, _, _ = setup
+        new_node = tk.operations._create_resultant_from_axes(
+            axes=[], name='custom', network=net, tensor=torch.tensor(2.))
+        assert new_node.shape == ()
+    
+    def test_stack_axes(self, setup):
+        net, _, _ = setup
+        nodes = [tk.randn(shape=(3, 4),
+                          axes_names=('left', 'right'),
+                          network=net)
+                 for _ in range(5)]
+        stack_node = tk.stack(nodes)
+        
+        new_node = tk.operations._create_resultant_from_axes(
+            axes=[stack_node['stack'].axis1, stack_node['left'].axis1],
+            name='custom',
+            network=net,
+            tensor=torch.randn(5, 3))
+        assert isinstance(new_node, tk.StackNode)
+        assert new_node.axes_names == ['stack', 'left']
+        
+        # The rest of axes should come from (Param)StackNodes
+        with pytest.raises(ValueError):
+            tk.operations._create_resultant_from_axes(
+                axes=[stack_node['stack'].axis1, 'new'],
+                name='custom',
+                network=net,
+                tensor=torch.randn(5, 3))
+    
+    def test_errors(self, setup):
+        net, node1, _ = setup
+        
+        # Wrong number of dimensions
+        with pytest.raises(ValueError):
+            tk.operations._create_resultant_from_axes(
+                axes=[node1['batch'].axis1],
+                name='custom',
+                network=net,
+                tensor=torch.randn(2, 3))
+        
+        # Size of inherited edge changed
+        with pytest.raises(ValueError):
+            tk.operations._create_resultant_from_axes(
+                axes=[node1['left'].axis1],
+                name='custom',
+                network=net,
+                tensor=torch.randn(7))
+        
+        # Wrong type of axis
+        with pytest.raises(TypeError):
+            tk.operations._create_resultant_from_axes(
+                axes=[0],
+                name='custom',
+                network=net,
+                tensor=torch.randn(2))
 
 
 class TestPermute:  # MARK: TestPermute
@@ -6127,6 +6224,357 @@ class TestEinsum:  # MARK: TestEinsum
 
         assert node2.shape == (100, 5)
         assert torch.allclose(node1.tensor, node2.tensor, atol=1e-7, rtol=1e-3)
+
+
+@tk.operation
+def scale_test_op(node, factor=2.):
+    return (lambda tensor: tensor * factor), node.axes
+
+
+@tk.operation
+def renormalize_log_test_op(node, *, axis):
+    axis_num = [node.get_axis_num(ax) for ax in axis]
+    other_axes = [ax for ax in node.axes if ax.num not in axis_num]
+    
+    def kernel(tensor):
+        norm = tensor.norm(dim=axis_num, keepdim=True)
+        log_norm = norm.log()
+        for num in sorted(axis_num, reverse=True):
+            log_norm = log_norm.squeeze(num)
+        return tensor / norm, log_norm
+    
+    return kernel, (node.axes, other_axes)
+
+
+@tk.operation(name='weighted_sum_test_op')
+def weighted_sum(nodes, weights):
+    def kernel(*tensors):
+        return sum([w * t for w, t in zip(weights, tensors)])
+    return kernel, nodes[0].axes
+
+
+@tk.operation
+def matmul_test_op(node, matrix, axis):
+    # New axis replaces ``axis``, multiplied by a fixed matrix
+    axis_num = node.get_axis_num(axis)
+    axes = node.axes[:axis_num] + ['new'] + node.axes[axis_num + 1:]
+    
+    def kernel(tensor):
+        return tensor.movedim(axis_num, -1).matmul(matrix).movedim(-1, axis_num)
+    
+    return kernel, axes
+
+
+class TestCustomOperation:  # MARK: TestCustomOperation
+    
+    def test_single_output(self):
+        node1 = tk.randn(shape=(2, 3), axes_names=('left', 'right'))
+        assert node1.successors == dict()
+        
+        node2 = scale_test_op(node1)
+        assert node2.is_resultant()
+        assert node2.name == 'scale_test_op'
+        assert node2.axes_names == ['left', 'right']
+        assert node2.edges == node1.edges
+        assert torch.equal(node2.tensor, node1.tensor * 2.)
+        assert 'scale_test_op' in tk.TensorNetwork.operations
+        assert node1.network._seq_ops[-1] == ('scale_test_op', (node1, 2.))
+        
+        # Repeat, also with keyword and default arguments
+        node3 = scale_test_op(node1, factor=2.)
+        assert node3 is node2
+        
+        # Other arguments give other resultant nodes
+        node4 = scale_test_op(node1, 3.)
+        assert node4 is not node2
+        assert torch.equal(node4.tensor, node1.tensor * 3.)
+        
+        # New tensor of the node is used in the next calls
+        node1.tensor = torch.randn(2, 3)
+        node5 = scale_test_op(node1)
+        assert node5 is node2
+        assert torch.equal(node5.tensor, node1.tensor * 2.)
+    
+    @pytest.mark.parametrize('param_node', [True, False])
+    def test_several_outputs(self, param_node):
+        node1 = tk.randn(shape=(2, 3, 4),
+                         axes_names=('batch', 'left', 'right'),
+                         param_node=param_node)
+        
+        node2, log_norm = renormalize_log_test_op(node1, axis=['left', 'right'])
+        assert node2.axes_names == ['batch', 'left', 'right']
+        assert log_norm.axes_names == ['batch']
+        assert log_norm['batch'] is node1['batch']
+        assert torch.allclose(node2.tensor * log_norm.tensor.exp()[:, None, None],
+                              node1.tensor)
+        
+        # Lists are turned into tuples
+        assert node1.successors['renormalize_log_test_op'][
+            (node1, ('left', 'right'))].child == (node2, log_norm)
+        node3, log_norm2 = renormalize_log_test_op(node1, axis=('left', 'right'))
+        assert (node3 is node2) and (log_norm2 is log_norm)
+    
+    def test_list_of_nodes_and_tensor_arguments(self):
+        net = tk.TensorNetwork()
+        nodes = [tk.randn(shape=(2, 3),
+                          axes_names=('left', 'right'),
+                          network=net)
+                 for _ in range(3)]
+        
+        result = weighted_sum(nodes, [1., 2., 3.])
+        assert result.name == 'weighted_sum_test_op'
+        expected = sum([w * node.tensor for w, node in zip([1., 2., 3.], nodes)])
+        assert torch.allclose(result.tensor, expected)
+        
+        # Tensors are hashable, they are recorded as any other argument
+        matrix = torch.randn(3, 5)
+        result = matmul_test_op(nodes[0], matrix, 'right')
+        assert result.axes_names == ['left', 'new']
+        assert result['new'].is_dangling()
+        assert torch.allclose(result.tensor, nodes[0].tensor @ matrix)
+    
+    def test_stack(self):
+        net = tk.TensorNetwork()
+        nodes = [tk.randn(shape=(2, 3),
+                          axes_names=('left', 'right'),
+                          network=net)
+                 for _ in range(4)]
+        stack_node = tk.stack(nodes)
+        
+        result = scale_test_op(stack_node)
+        assert isinstance(result, tk.StackNode)
+        
+        unbound = tk.unbind(result)
+        for node, unbound_node in zip(nodes, unbound):
+            assert torch.allclose(unbound_node.tensor, 2. * node.tensor)
+    
+    @pytest.mark.parametrize('auto_stack, auto_unbind', STACK_AUTO_CASES)
+    def test_in_forward(self, auto_stack, auto_unbind):
+        
+        class CustomOpTN(tk.TensorNetwork):
+            
+            def __init__(self):
+                super().__init__(name='custom_op_tn')
+                self.mats = [tk.randn(shape=(4, 3, 4),
+                                      axes_names=('left', 'input', 'right'),
+                                      name='mat',
+                                      network=self,
+                                      param_node=True,
+                                      dtype=torch.float64)
+                             for _ in range(5)]
+                for i in range(4):
+                    self.mats[i]['right'] ^ self.mats[i + 1]['left']
+            
+            def set_data_nodes(self) -> None:
+                super().set_data_nodes([mat['input'] for mat in self.mats],
+                                       num_batch_edges=1)
+            
+            def contract(self):
+                stack_mats = tk.stack(self.mats)
+                stack_data = tk.stack(list(self.data_nodes.values()))
+                stack_mats ^ stack_data
+                mats = tk.unbind(stack_data @ scale_test_op(stack_mats, 0.5))
+                
+                result = mats[0]
+                log_norm = None
+                for mat in mats[1:]:
+                    result @= mat
+                    result, log_n = renormalize_log_test_op(
+                        result, axis=['left', 'right'])
+                    if log_norm is None:
+                        log_norm = log_n
+                    else:
+                        log_norm = log_norm + log_n
+                
+                return result, log_norm
+            
+            def expected(self, data):
+                result = torch.einsum('bi,lir->blr',
+                                      data[:, 0],
+                                      0.5 * self.mats[0].tensor)
+                for i, mat in enumerate(self.mats[1:]):
+                    result = torch.einsum('blr,bi,rik->blk',
+                                          result,
+                                          data[:, i + 1],
+                                          0.5 * mat.tensor)
+                return result
+        
+        net = CustomOpTN()
+        net.auto_stack = auto_stack
+        net.auto_unbind = auto_unbind
+        
+        for _ in range(2):
+            for batch_size in [1, 6]:
+                data = torch.randn(batch_size, 5, 3, dtype=torch.float64)
+                expected = net.expected(data)
+                for _ in range(2):
+                    result, log_norm = net(data)
+                    assert torch.allclose(
+                        result * log_norm.exp()[:, None, None], expected)
+            
+            net.trace(torch.zeros(1, 5, 3, dtype=torch.float64))
+            for batch_size in [1, 6]:
+                data = torch.randn(batch_size, 5, 3, dtype=torch.float64)
+                expected = net.expected(data)
+                for _ in range(2):
+                    result, log_norm = net(data)
+                    assert torch.allclose(
+                        result * log_norm.exp()[:, None, None], expected)
+            
+            # Gradients flow through custom operations
+            net.zero_grad()
+            (result.sum() + log_norm.sum()).backward()
+            assert all([mat.grad is not None for mat in net.mats])
+            
+            net.reset()
+            assert net.resultant_nodes == dict()
+            for mat in net.mats:
+                assert mat.successors == dict()
+    
+    def test_leaf_node_name(self):
+        node = tk.randn(shape=(2, 3), name='node')
+        with pytest.raises(ValueError):
+            node.name = 'scale_test_op'
+        assert node.name == 'node'
+    
+    def test_errors_definition(self):
+        def kernel_fn(node):
+            return (lambda tensor: tensor), node.axes
+        
+        # Names of built-in operations
+        with pytest.raises(ValueError):
+            tk.operation(kernel_fn, name='renormalize')
+        
+        # Names with blank spaces
+        with pytest.raises(ValueError):
+            tk.operation(kernel_fn, name='my op')
+        
+        with pytest.raises(TypeError):
+            tk.operation(kernel_fn, name=3)
+        
+        with pytest.raises(TypeError):
+            tk.operation(3)
+        
+        # Arguments cannot be variable
+        def var_args(node, *nodes):
+            return (lambda tensor: tensor), node.axes
+        
+        with pytest.raises(TypeError):
+            tk.operation(var_args)
+        
+        def var_kwargs(node, **kwargs):
+            return (lambda tensor: tensor), node.axes
+        
+        with pytest.raises(TypeError):
+            tk.operation(var_kwargs)
+        
+        # Two different functions cannot share a name
+        def scale_test_op(node):
+            return (lambda tensor: tensor), node.axes
+        
+        with pytest.raises(ValueError):
+            tk.operation(scale_test_op)
+        
+        # Unless another name is given
+        other_op = tk.operation(scale_test_op, name='other_scale_test_op')
+        node = tk.randn(shape=(2, 3))
+        assert torch.equal(other_op(node).tensor, node.tensor)
+        
+        # Redefining the same function is allowed, but only the last
+        # definition can be used, since both share resultant nodes
+        def kernel_fn(node):
+            return (lambda tensor: 2 * tensor), node.axes
+        
+        old_op = tk.operation(kernel_fn)
+        new_op = tk.operation(kernel_fn)
+        assert torch.equal(new_op(node).tensor, 2 * node.tensor)
+        with pytest.raises(ValueError):
+            old_op(node)
+        
+        # E.g. operations made by the same factory
+        def make_scale_op(factor):
+            def scale_factory_test_op(node):
+                return (lambda tensor: factor * tensor), node.axes
+            return tk.operation(scale_factory_test_op)
+        
+        scale_2 = make_scale_op(2.)
+        scale_3 = make_scale_op(3.)
+        assert torch.equal(scale_3(node).tensor, 3 * node.tensor)
+        with pytest.raises(ValueError):
+            scale_2(node)
+        
+        # Callables without name need ``name``
+        class Identity:
+            def __call__(self, node):
+                return (lambda tensor: tensor), node.axes
+        
+        with pytest.raises(TypeError):
+            tk.operation(Identity())
+        identity = tk.operation(Identity(), name='identity_test_op')
+        assert torch.equal(identity(node).tensor, node.tensor)
+    
+    def test_errors_call(self):
+        node1 = tk.randn(shape=(2, 3), axes_names=('left', 'right'))
+        node2 = tk.randn(shape=(2, 3), axes_names=('left', 'right'))
+        
+        # No nodes
+        with pytest.raises(TypeError):
+            scale_test_op(torch.randn(2, 3))
+        
+        # Nodes in different networks
+        with pytest.raises(ValueError):
+            weighted_sum([node1, node2], [1., 1.])
+        
+        # Unhashable arguments
+        with pytest.raises(TypeError):
+            scale_test_op(node1, {'factor': 2.})
+        
+        # Wrong arguments
+        with pytest.raises(TypeError):
+            scale_test_op(node1, 2., 3.)
+        
+        @tk.operation
+        def no_kernel_test_op(node):
+            return node.axes
+        
+        with pytest.raises(TypeError):
+            no_kernel_test_op(node1)
+        
+        @tk.operation
+        def wrong_axes_test_op(node):
+            return (lambda tensor: tensor), node.axes[0]
+        
+        with pytest.raises(TypeError):
+            wrong_axes_test_op(node1)
+        
+        @tk.operation
+        def other_node_test_op(node):
+            return (lambda tensor: tensor), node2.axes
+        
+        with pytest.raises(ValueError):
+            other_node_test_op(node1)
+        
+        @tk.operation
+        def wrong_count_test_op(node):
+            return (lambda tensor: (tensor, tensor)), (node.axes, node.axes,
+                                                       node.axes)
+        
+        with pytest.raises(ValueError):
+            wrong_count_test_op(node1)
+        
+        @tk.operation
+        def no_tensor_test_op(node):
+            return (lambda tensor: tensor.tolist()), node.axes
+        
+        with pytest.raises(TypeError):
+            no_tensor_test_op(node1)
+        
+        @tk.operation
+        def wrong_shape_test_op(node):
+            return (lambda tensor: tensor.sum(0)), node.axes
+        
+        with pytest.raises(ValueError):
+            wrong_shape_test_op(node1)
 
 
 class TestTNModels:  # MARK: TestTNModels
