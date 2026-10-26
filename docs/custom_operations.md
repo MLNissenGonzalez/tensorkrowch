@@ -145,7 +145,7 @@ class LogNormMPS(tk.models.MPS):
         result @= self._right_node
         return result, log_norm
 
-mps = LogNormMPS(n_features=784, phys_dim=2, bond_dim=20)   # obc
+mps = LogNormMPS(n_sites=784, phys_dim=2, bond_dim=20)   # obc
 mps.trace(torch.zeros(1, 784, 2))
 result, log_norm = mps(data)               # shapes (batch,) and (batch,)
 log_psi = result.abs().log() + log_norm    # finite, also in float32
