@@ -615,7 +615,7 @@ does not match. Batch edges admit any size.
 - `operands(*args)` gives the core the nodes of the arguments without
   searching them (`isinstance` against the abstract `AbstractNode` costs
   about 0.5 µs per argument). Per call of `a @ b` on small tensors, which
-  measures only lookup and replay: 12.1 µs on develop-unified, 13.0 µs with
+  measures only lookup and replay: 12.1 µs hand-written, 13.0 µs with
   the core (15 µs before `operands`). The difference is the kernel closure.
 - Tests: `tests/test_operations.py::TestContractKeepRescale` (the issue's
   operation as reference, the three cases, gradients, trace, errors).
