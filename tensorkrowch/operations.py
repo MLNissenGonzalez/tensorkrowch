@@ -221,7 +221,8 @@ def _runtime_values(args: Tuple[Any, ...], runtime: Sequence[int]) -> List[Any]:
 def _build_operation(name: Text,
                      fn: Callable,
                      key: Optional[Callable] = None,
-                     runtime: Sequence[int] = ()) -> Operation:
+                     runtime: Sequence[int] = (),
+                     operands: Optional[Callable] = None) -> Operation:
     """
     Builds and registers the :class:`Operation` ``name``, for built-in and
     custom (see :func:`operation`) operations.
@@ -237,9 +238,16 @@ def _build_operation(name: Text,
     ``runtime`` that are not nodes (e.g. a tensor multiplying a node) are not
     fixed in the first call: their values are passed to ``kernel`` in every
     call, after the tensors.
+    
+    ``operands(*args)`` returns the nodes in ``args``, for operations whose
+    signature says where they are; by default, ``args`` are searched (also
+    inside tuples), which costs a few microseconds per call.
     """
+    if operands is None:
+        operands = lambda *args: _operand_nodes(args)
+    
     def check_first(*args) -> Optional[Successor]:
-        nodes = _operand_nodes(args)
+        nodes = operands(*args)
         if not nodes:
             raise TypeError(f'Operation "{name}" should receive at least one '
                             'node')
@@ -249,7 +257,7 @@ def _build_operation(name: Text,
         return successors.get(args if key is None else key(*args))
     
     def fn_first(*args) -> Union[Node, Tuple[Node, ...]]:
-        nodes = _operand_nodes(args)
+        nodes = operands(*args)
         net = nodes[0]._network
         for node in nodes[1:]:
             if node._network != net:
@@ -324,13 +332,14 @@ def _build_operation(name: Text,
         return child
     
     def fn_next(successor: Successor, *args) -> Union[Node, Tuple[Node, ...]]:
-        nodes = _operand_nodes(args)
+        nodes = operands(*args)
         tensors = [node._direct_get_tensor(node_ref, index)
                    for node, node_ref, index in zip(nodes,
                                                     successor.node_ref,
                                                     successor.index)]
-        tensors = successor.hints['kernel'](*tensors,
-                                            *_runtime_values(args, runtime))
+        if runtime:
+            tensors += _runtime_values(args, runtime)
+        tensors = successor.hints['kernel'](*tensors)
         
         child = successor.child
         if successor.hints['single']:
@@ -370,7 +379,8 @@ def _permute_plan(node: AbstractNode,
         permute_list(node._axes, axes_nums)
 
 
-permute_op = _build_operation('permute', _permute_plan)
+permute_op = _build_operation('permute', _permute_plan,
+                              operands=lambda node, axes: (node,))
 
 
 def permute(node: AbstractNode, axes: Sequence[Ax]) -> Node:
@@ -538,7 +548,8 @@ def _tprod_plan(node1: AbstractNode,
     return kernel, node1._axes + node2._axes
 
 
-tprod_op = _build_operation('tprod', _tprod_plan)
+tprod_op = _build_operation('tprod', _tprod_plan,
+                            operands=lambda node1, node2: (node1, node2))
 
 
 def tprod(node1: AbstractNode, node2: AbstractNode) -> Node:
@@ -628,6 +639,14 @@ def _elementwise_plan(fn: Callable) -> Callable:
     return plan
 
 
+def _elementwise_operands(node1: AbstractNode,
+                          node2: Union[AbstractNode, torch.Tensor, Number]
+                          ) -> Tuple[AbstractNode, ...]:
+    if isinstance(node2, AbstractNode):
+        return (node1, node2)
+    return (node1,)
+
+
 def _elementwise_key(node1: AbstractNode,
                      node2: Union[AbstractNode, torch.Tensor, Number]) -> Tuple:
     # Tensors and numbers are not part of the key: the resultant node is the
@@ -642,7 +661,8 @@ def _elementwise_key(node1: AbstractNode,
 mul_op = _build_operation('mul',
                           _elementwise_plan(operator.mul),
                           key=_elementwise_key,
-                          runtime=(1,))
+                          runtime=(1,),
+                          operands=_elementwise_operands)
 
 
 def mul(node1: AbstractNode,
@@ -762,7 +782,8 @@ AbstractNode.mul = mul_node
 div_op = _build_operation('div',
                           _elementwise_plan(operator.truediv),
                           key=_elementwise_key,
-                          runtime=(1,))
+                          runtime=(1,),
+                          operands=_elementwise_operands)
 
 
 def div(node1: AbstractNode,
@@ -882,7 +903,8 @@ AbstractNode.div = div_node
 add_op = _build_operation('add',
                           _elementwise_plan(operator.add),
                           key=_elementwise_key,
-                          runtime=(1,))
+                          runtime=(1,),
+                          operands=_elementwise_operands)
 
 
 def add(node1: AbstractNode,
@@ -1002,7 +1024,8 @@ AbstractNode.add = add_node
 sub_op = _build_operation('sub',
                           _elementwise_plan(operator.sub),
                           key=_elementwise_key,
-                          runtime=(1,))
+                          runtime=(1,),
+                          operands=_elementwise_operands)
 
 
 def sub(node1: AbstractNode,
@@ -1140,7 +1163,8 @@ def _renormalize_plan(
     return kernel, node._axes
 
 
-renormalize_op = _build_operation('renormalize', _renormalize_plan)
+renormalize_op = _build_operation('renormalize', _renormalize_plan,
+                                  operands=lambda node, p, axis: (node,))
 
 
 def renormalize(
@@ -1217,7 +1241,8 @@ AbstractNode.renormalize = renormalize_node
 ##################################   conj    ##################################
 # MARK: conj
 conj_op = _build_operation(
-    'conj', lambda node: ((lambda tensor: tensor.conj()), node._axes))
+    'conj', lambda node: ((lambda tensor: tensor.conj()), node._axes),
+    operands=lambda node: (node,))
 
 
 def conj(node: AbstractNode) -> Node:
@@ -3561,16 +3586,6 @@ Edge.rq_ = rq_edge_
 
 ################################   CONTRACT    ################################
 # MARK: contract_edges
-def _check_first_contract_edges(edges: Optional[List[Edge]],
-                                node1: AbstractNode,
-                                node2: AbstractNode) -> Optional[Successor]:
-    args = (None if edges is None else tuple(edges), node1, node2)
-    successors = node1._successors.get('contract_edges')
-    if successors is None:
-        return None
-    return successors.get(args)
-
-
 def _permute_contract_reshape(tensor1, tensor2, permutation_dims, shape_limits):
     batch = shape_limits[0]
     non_contract_0 = shape_limits[1]
@@ -3608,16 +3623,12 @@ def _permute_contract_reshape(tensor1, tensor2, permutation_dims, shape_limits):
     return result
 
 
-def _contract_edges_first(edges: Optional[List[Edge]],
-                          node1: AbstractNode,
-                          node2: AbstractNode) -> Node:
+def _contract_edges_plan(edges: Optional[Tuple[Edge, ...]],
+                         node1: AbstractNode,
+                         node2: AbstractNode,
+                         keep: Tuple[Text, ...] = (),
+                         rescale: bool = False) -> Tuple[Callable, Sequence]:
     shared_edges = get_shared_edges(node1, node2)
-    if not shared_edges:
-        raise ValueError(f'No batch edges or shared edges between nodes '
-                         f'{node1!s} and {node2!s} found')
-        
-    args = (None if edges is None else tuple(edges), node1, node2)
-
     if edges is None:
         edges = shared_edges
     else:
@@ -3625,19 +3636,46 @@ def _contract_edges_first(edges: Optional[List[Edge]],
             if edge not in shared_edges:
                 raise ValueError('Edges selected to be contracted must be '
                                  'shared edges between `node1` and `node2`')
-
-    # Trace
-    if node1 == node2:
-        result = node1.tensor
+    
+    node1_is_stack = isinstance(node1, (StackNode, ParamStackNode))
+    node2_is_stack = isinstance(node2, (StackNode, ParamStackNode))
+    if node1_is_stack != node2_is_stack:
+        raise TypeError('Can only contract (Param)StackNode with other '
+                        '(Param)StackNode')
+    
+    # Kept legs: carried by both nodes and kept once in the result,
+    # element-wise along them. Batch edges with the same name are always kept
+    for name in keep:
+        if node1 is node2:
+            raise ValueError('`keep` cannot be used to contract a node with '
+                             'itself')
+        for node in (node1, node2):
+            if (name not in node.axes_names) or not node[name].is_dangling():
+                raise ValueError(f'Kept axis "{name}" should be a dangling '
+                                 f'axis of both nodes, but it is not in '
+                                 f'{node!s}')
+        if node1[name].size() != node2[name].size():
+            raise ValueError(f'Kept axis "{name}" should have the same size '
+                             'in both nodes')
+    kept_names = []
+    if node1 is not node2:
+        kept_names = [axis._name for axis in node1._axes
+                      if (axis._batch and (axis._name in node2.axes_names)
+                          and node2.get_axis(axis._name)._batch)
+                      or (axis._name in keep)]
+    
+    if not shared_edges and not kept_names:
+        raise ValueError(f'No batch edges, kept edges or shared edges between '
+                         f'nodes {node1!s} and {node2!s} found')
+    
+    if node1 is node2:
+        # Trace: each contracted edge is a diagonal, summed
         axes_nums = dict(zip(range(node1.ndim), range(node1.ndim)))
-
+        diagonals = []
         for edge in edges:
             axes = node1.in_which_axis(edge)
-            result = torch.diagonal(result,
-                                    offset=0,
-                                    dim1=axes_nums[axes[0]._num],
-                                    dim2=axes_nums[axes[1]._num])
-            result = result.sum(-1)
+            diagonals.append((axes_nums[axes[0]._num],
+                              axes_nums[axes[1]._num]))
             min_axis = min(axes[0]._num, axes[1]._num)
             max_axis = max(axes[0]._num, axes[1]._num)
             for num in axes_nums:
@@ -3651,221 +3689,122 @@ def _contract_edges_first(edges: Optional[List[Edge]],
                     axes_nums[num] = -1
                 elif num > max_axis:
                     axes_nums[num] -= 2
-
-        new_axes_names = []
-        new_edges = []
-        new_node1_list = []
-        for num in axes_nums:
-            if axes_nums[num] >= 0:
-                new_axes_names.append(node1._axes[num]._name)
-                new_edges.append(node1._edges[num])
-                new_node1_list.append(node1.is_node1(num))
-
-        hints = edges
-
-        # Record in inverse_memory while tracing
-        if node1._network._tracing:
-            node1._record_in_inverse_memory()
-
+        
+        def kernel(tensor, _):
+            for dim1, dim2 in diagonals:
+                tensor = torch.diagonal(tensor, offset=0, dim1=dim1, dim2=dim2)
+                tensor = tensor.sum(-1)
+            return tensor
+        
+        out_axes = [node1._axes[num] for num in axes_nums
+                    if axes_nums[num] >= 0]
+    
     else:
         nodes = [node1, node2]
-        tensors = [node1.tensor, node2.tensor]
+        kept_edges = dict()
         non_contract_edges = [dict(), dict()]
-        batch_edges = dict()
         contract_edges = dict()
-
         for i in [0, 1]:
             for j, axis in enumerate(nodes[i]._axes):
                 edge = nodes[i]._edges[j]
                 if edge in edges:
-                    if i == 0:
-                        contract_edges[edge] = [j]
-                    else:
-                        contract_edges[edge].append(j)
-
-                elif axis._batch:
-                    if i == 0:
-                        batch_in_node2 = False
-                        for aux_axis in nodes[1]._axes:
-                            if aux_axis._batch and \
-                                    (axis._name == aux_axis._name):
-                                batch_edges[axis._name] = [j]
-                                batch_in_node2 = True
-                                break
-                        if not batch_in_node2:
-                            non_contract_edges[i][axis._name] = j
-                    else:
-                        if axis._name in batch_edges:
-                            batch_edges[axis._name].append(j)
-                        else:
-                            non_contract_edges[i][axis._name] = j
+                    contract_edges.setdefault(edge, []).append(j)
+                elif axis._name in kept_names:
+                    kept_edges.setdefault(axis._name, []).append(j)
                 else:
                     non_contract_edges[i][axis._name] = j
-
-        permutation_dims = [None, None]
-
-        batch_edges_perm_0 = list(map(lambda l: l[0], batch_edges.values()))
-        batch_edges_perm_1 = list(map(lambda l: l[1], batch_edges.values()))
-
-        non_contract_edges_perm_0 = list(non_contract_edges[0].values())
-        non_contract_edges_perm_1 = list(non_contract_edges[1].values())
-
-        contract_edges_perm_0 = list(
-            map(lambda l: l[0], contract_edges.values()))
-        contract_edges_perm_1 = list(
-            map(lambda l: l[1], contract_edges.values()))
-
-        permutation_dims[0] = batch_edges_perm_0 + non_contract_edges_perm_0 + \
-            contract_edges_perm_0
-        permutation_dims[1] = batch_edges_perm_1 + contract_edges_perm_1 + \
-            non_contract_edges_perm_1
-
+        
+        permutation_dims = [
+            [l[0] for l in kept_edges.values()] +
+            list(non_contract_edges[0].values()) +
+            [l[0] for l in contract_edges.values()],
+            [l[1] for l in kept_edges.values()] +
+            [l[1] for l in contract_edges.values()] +
+            list(non_contract_edges[1].values())]
         for i in [0, 1]:
             if permutation_dims[i] == list(range(len(permutation_dims[i]))):
                 permutation_dims[i] = []
-
-        shape_limits = (len(batch_edges),
+        
+        shape_limits = (len(kept_edges),
                         len(non_contract_edges[0]),
                         len(contract_edges))
         
-        result = _permute_contract_reshape(tensors[0], tensors[1],
-                                           permutation_dims,
-                                           shape_limits)
-
-        # Put batch dims at the beginning
-        indices = [None, None]
-        indices[0] = list(map(lambda l: l[0], batch_edges.values())) + \
-            list(non_contract_edges[0].values())
-        indices[1] = list(non_contract_edges[1].values())
-
-        new_axes_names = []
-        new_edges = []
-        new_node1_list = []
-        for i in [0, 1]:
-            for idx in indices[i]:
-                new_axes_names.append(nodes[i].axes_names[idx])
-                new_edges.append(nodes[i][idx])
-                new_node1_list.append(nodes[i].axes[idx].is_node1())
-
-        hints = {'shape_limits': shape_limits,
-                 'permutation_dims': permutation_dims}
-
-        # Record in inverse_memory while tracing
-        if node1._network._tracing:
-            node1._record_in_inverse_memory()
-            node2._record_in_inverse_memory()
-
-    node1_is_stack = isinstance(node1, (StackNode, ParamStackNode))
-    node2_is_stack = isinstance(node2, (StackNode, ParamStackNode))
-    if node1_is_stack and node2_is_stack:
-        new_node = StackNode._create_resultant(axes_names=new_axes_names,
-                                               name='contract_edges',
-                                               network=node1._network,
-                                               tensor=result,
-                                               edges=new_edges,
-                                               node1_list=new_node1_list)
-    elif node1_is_stack or node2_is_stack:
-        raise TypeError('Can only contract (Param)StackNode with other '
-                        '(Param)StackNode')
-    else:
-        new_node = Node._create_resultant(axes_names=new_axes_names,
-                                          name='contract_edges',
-                                          network=node1._network,
-                                          tensor=result,
-                                          edges=new_edges,
-                                          node1_list=new_node1_list)
-
-    # Create successor
-    net = node1._network
-    successor = Successor(node_ref=(node1.node_ref(),
-                                    node2.node_ref()),
-                          index=(node1._tensor_info['index'],
-                                 node2._tensor_info['index']),
-                          child=new_node,
-                          hints=hints)
-
-    # Add successor to parent
-    if 'contract_edges' in node1._successors:
-        node1._successors['contract_edges'].update({args: successor})
-    else:
-        node1._successors['contract_edges'] = {args: successor}
-
-    # Add operation to list of performed operations of TN
-    net._seq_ops.append(('contract_edges', args))
-
-    return new_node
-
-
-def _contract_edges_next(successor: Successor,
-                         edges: Optional[List[Edge]],
-                         node1: AbstractNode,
-                         node2: AbstractNode) -> Node:
-    if node1 == node2:
-        edges = successor.hints
-        result = node1._direct_get_tensor(successor.node_ref[0],
-                                          successor.index[0])
-        axes_nums = dict(zip(range(node1.ndim), range(node1.ndim)))
-
-        for edge in edges:
-            axes = node1.in_which_axis(edge)
-            result = torch.diagonal(result,
-                                    offset=0,
-                                    dim1=axes_nums[axes[0]._num],
-                                    dim2=axes_nums[axes[1]._num])
-            result = result.sum(-1)
-            min_axis = min(axes[0]._num, axes[1]._num)
-            max_axis = max(axes[0]._num, axes[1]._num)
-            for num in axes_nums:
-                if num < min_axis:
-                    continue
-                elif num == min_axis:
-                    axes_nums[num] = -1
-                elif (num > min_axis) and (num < max_axis):
-                    axes_nums[num] -= 1
-                elif num == max_axis:
-                    axes_nums[num] = -1
-                elif num > max_axis:
-                    axes_nums[num] -= 2
-
-        # Record in inverse_memory while contracting, if network is traced
-        # (to delete memory if possible)
-        if node1._network._traced:
-            node1._check_inverse_memory(successor.node_ref[0])
-
-    else:
-        hints = successor.hints
-        tensors = [node1._direct_get_tensor(successor.node_ref[0],
-                                            successor.index[0]),
-                   node2._direct_get_tensor(successor.node_ref[1],
-                                            successor.index[1])]
+        def kernel(tensor1, tensor2):
+            return _permute_contract_reshape(tensor1, tensor2,
+                                             permutation_dims,
+                                             shape_limits)
         
-        result = _permute_contract_reshape(tensors[0], tensors[1],
-                                           hints['permutation_dims'],
-                                           hints['shape_limits'])
+        # Kept dims first, then the rest of node1 and node2
+        out_axes = [node1._axes[l[0]] for l in kept_edges.values()] + \
+            [node1._axes[j] for j in non_contract_edges[0].values()] + \
+            [node2._axes[j] for j in non_contract_edges[1].values()]
+    
+    if not rescale:
+        return kernel, out_axes
+    
+    # The scale of each sample (batch axes) is the largest |entry|, detached,
+    # and 1 if the result is 0
+    batch_dims = [i for i, axis in enumerate(out_axes) if axis._batch]
+    other_dims = tuple(i for i in range(len(out_axes)) if i not in batch_dims)
+    
+    def rescale_kernel(tensor1, tensor2):
+        result = kernel(tensor1, tensor2)
+        scale = result.detach().abs()
+        if other_dims:
+            scale = scale.amax(dim=other_dims, keepdim=True)
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        log_scale = scale.log().reshape([result.shape[i] for i in batch_dims])
+        return result / scale, log_scale
+    
+    return rescale_kernel, (out_axes, [out_axes[i] for i in batch_dims])
 
-        # Record in inverse_memory while contracting, if network is traced
-        # (to delete memory if possible)
-        if node1._network._traced:
-            node1._check_inverse_memory(successor.node_ref[0])
-            node2._check_inverse_memory(successor.node_ref[1])
 
-    child = successor.child
-    child._direct_set_tensor(result)
-
-    return child
+contract_edges_op = _build_operation(
+    'contract_edges', _contract_edges_plan,
+    operands=lambda edges, node1, node2, *options: (node1, node2))
 
 
-contract_edges_op = Operation('contract_edges',
-                              _check_first_contract_edges,
-                              _contract_edges_first,
-                              _contract_edges_next)
+def _contract_edges_call(edges: Optional[Sequence[Edge]],
+                         node1: AbstractNode,
+                         node2: AbstractNode,
+                         keep: Optional[Union[Text, Sequence[Text]]] = None,
+                         rescale: bool = False) -> Union[Node, Tuple[Node, Node]]:
+    """
+    Calls ``contract_edges_op`` with hashable arguments. ``keep`` and
+    ``rescale`` are only passed if they are given, so that the key of the
+    successor is ``(edges, node1, node2)`` otherwise.
+    """
+    if edges is not None:
+        edges = tuple(edges)
+    if (keep is None) and (rescale is False):
+        return contract_edges_op(edges, node1, node2)
+    
+    if keep is None:
+        keep = ()
+    elif isinstance(keep, str):
+        keep = (keep,)
+    elif isinstance(keep, (list, tuple)):
+        keep = tuple(keep)
+    else:
+        raise TypeError('`keep` should be str or sequence of str type')
+    if any([not isinstance(name, str) for name in keep]):
+        raise TypeError('`keep` should be str or sequence of str type')
+    if not isinstance(rescale, bool):
+        raise TypeError('`rescale` should be bool type')
+    
+    if keep or rescale:
+        return contract_edges_op(edges, node1, node2, keep, rescale)
+    return contract_edges_op(edges, node1, node2)
 
 
 def contract_edges(edges: Optional[List[Edge]],
                    node1: AbstractNode,
-                   node2: AbstractNode) -> Node:
+                   node2: AbstractNode,
+                   keep: Optional[Union[Text, Sequence[Text]]] = None,
+                   rescale: bool = False) -> Union[Node, Tuple[Node, Node]]:
     """
-    Contracts all selected edges between two nodes.
+    Contracts all selected edges between two nodes, keeping once the axes
+    they share (batch axes and ``keep``).
     
     Nodes ``resultant`` from this operation are called ``"contract_edges"``.
     The node that keeps information about the :class:`Successor` is ``node1``.
@@ -3882,10 +3821,24 @@ def contract_edges(edges: Optional[List[Edge]],
     node2 : AbstractNode
         Second node of the contraction. Its non-contracted edges will appear
         last in the list of inherited edges of the resultant node.
+    keep : str or list[str], optional
+        Names of axes that both nodes have as dangling axes, and that the
+        resultant node keeps once: the contraction is element-wise along them
+        (a hyperedge between both nodes and the result). Batch axes with the
+        same name in both nodes are always kept, as before.
+    rescale : bool
+        Boolean indicating whether the result is divided by its scale, the
+        largest absolute value of its entries for each sample (each index of
+        its batch axes), which is also returned, in logarithmic scale, in a
+        node with the batch axes of the result. The scale is not
+        differentiated (detached), so ``log|result| + log_scale`` and its
+        gradients are exact. A result equal to 0 keeps scale 1.
 
     Returns
     -------
-    Node
+    Node or tuple[Node, Node]
+        The resultant node, or the rescaled node and the log-scale node if
+        ``rescale = True``.
     
     Examples
     --------
@@ -3910,7 +3863,7 @@ def contract_edges(edges: Optional[List[Edge]],
     >>> result2.shape
     torch.Size([])
     """
-    return contract_edges_op(edges, node1, node2)
+    return _contract_edges_call(edges, node1, node2, keep, rescale)
 
 
 def contract(edge: Edge) -> Node:
@@ -3953,7 +3906,7 @@ def contract(edge: Edge) -> Node:
     >>> result.shape
     torch.Size([15, 20, 15, 20])
     """
-    return contract_edges_op([edge], edge.node1, edge.node2)
+    return _contract_edges_call([edge], edge.node1, edge.node2)
 
 contract_edge = copy_func(contract)
 contract_edge.__doc__ = \
@@ -4041,7 +3994,7 @@ def contract_(edge: Edge) -> Node:
     >>> del nodeB
     """
     nodes = [edge.node1, edge.node2]
-    result = contract_edges_op([edge], nodes[0], nodes[1])
+    result = _contract_edges_call([edge], nodes[0], nodes[1])
     result.reattach_edges(override=True)
     result._unrestricted_set_tensor(result.tensor.detach())
     
@@ -4130,11 +4083,19 @@ def get_shared_edges(node1: AbstractNode,
 
 
 def contract_between(node1: AbstractNode,
-                     node2: AbstractNode) -> Node:
+                     node2: AbstractNode,
+                     keep: Optional[Union[Text, Sequence[Text]]] = None,
+                     rescale: bool = False) -> Union[Node, Tuple[Node, Node]]:
     """
     Contracts all edges shared between two nodes. Batch contraction is
     automatically performed when both nodes have batch edges with the same
     names. It can also be performed using the operator ``@``.
+    
+    Other dangling axes that both nodes have can be kept once with ``keep``:
+    the contraction is element-wise along them, as along batch axes. Nodes
+    that only share batch or kept axes are contracted as an outer product in
+    the rest of axes. With ``rescale = True``, the result is divided by its
+    largest absolute value per sample, whose logarithm is also returned.
     
     Nodes ``resultant`` from this operation are called ``"contract_edges"``.
     The node that keeps information about the :class:`Successor` is ``node1``.
@@ -4149,10 +4110,24 @@ def contract_between(node1: AbstractNode,
     node2 : AbstractNode
         Second node of the contraction. Its non-contracted edges will appear
         last in the list of inherited edges of the resultant node.
+    keep : str or list[str], optional
+        Names of axes that both nodes have as dangling axes, and that the
+        resultant node keeps once: the contraction is element-wise along them
+        (a hyperedge between both nodes and the result). Batch axes with the
+        same name in both nodes are always kept, as before.
+    rescale : bool
+        Boolean indicating whether the result is divided by its scale, the
+        largest absolute value of its entries for each sample (each index of
+        its batch axes), which is also returned, in logarithmic scale, in a
+        node with the batch axes of the result. The scale is not
+        differentiated (detached), so ``log|result| + log_scale`` and its
+        gradients are exact. A result equal to 0 keeps scale 1.
 
     Returns
     -------
-    Node
+    Node or tuple[Node, Node]
+        The resultant node, or the rescaled node and the log-scale node if
+        ``rescale = True``.
     
     Examples
     --------
@@ -4167,8 +4142,28 @@ def contract_between(node1: AbstractNode,
     >>> result = tk.contract_between(nodeA, nodeB)
     >>> result.shape
     torch.Size([100, 10, 7])
+    
+    Two nodes that share the axis ``"x"`` (e.g. the ket and the bra of a
+    variable whose diagonal is wanted) and a connected edge. The result keeps
+    ``"x"`` once, and is rescaled:
+    
+    >>> net = tk.TensorNetwork()
+    >>> ket = tk.Node(tensor=torch.linspace(-1, 1, 1500).view(100, 3, 5),
+    ...               axes_names=('batch', 'x', 'right'),
+    ...               network=net)
+    >>> bra = tk.Node(tensor=torch.linspace(1, 2, 1500).view(100, 5, 3),
+    ...               axes_names=('batch', 'left', 'x'),
+    ...               network=net)
+    >>> _ = ket['right'] ^ bra['left']
+    >>> result, log_scale = tk.contract_between(ket, bra, keep='x', rescale=True)
+    >>> result.axes_names, log_scale.axes_names
+    (['batch', 'x'], ['batch'])
+    
+    >>> value = torch.einsum('bxr,brx->bx', ket.tensor, bra.tensor)
+    >>> torch.allclose(result.tensor * log_scale.tensor.exp()[:, None], value)
+    True
     """
-    return contract_edges_op(None, node1, node2)
+    return _contract_edges_call(None, node1, node2, keep, rescale)
 
 
 contract_between_node = copy_func(contract_between)
@@ -4178,6 +4173,12 @@ contract_between_node.__doc__ = \
     automatically performed when both nodes have batch edges with the same
     names. It can also be performed using the operator ``@``.
     
+    Other dangling axes that both nodes have can be kept once with ``keep``:
+    the contraction is element-wise along them, as along batch axes. Nodes
+    that only share batch or kept axes are contracted as an outer product in
+    the rest of axes. With ``rescale = True``, the result is divided by its
+    largest absolute value per sample, whose logarithm is also returned.
+    
     Nodes ``resultant`` from this operation are called ``"contract_edges"``.
     The node that keeps information about the :class:`Successor` is ``self``.
 
@@ -4186,10 +4187,24 @@ contract_between_node.__doc__ = \
     node2 : AbstractNode
         Second node of the contraction. Its non-contracted edges will appear
         last in the list of inherited edges of the resultant node.
+    keep : str or list[str], optional
+        Names of axes that both nodes have as dangling axes, and that the
+        resultant node keeps once: the contraction is element-wise along them
+        (a hyperedge between both nodes and the result). Batch axes with the
+        same name in both nodes are always kept, as before.
+    rescale : bool
+        Boolean indicating whether the result is divided by its scale, the
+        largest absolute value of its entries for each sample (each index of
+        its batch axes), which is also returned, in logarithmic scale, in a
+        node with the batch axes of the result. The scale is not
+        differentiated (detached), so ``log|result| + log_scale`` and its
+        gradients are exact. A result equal to 0 keeps scale 1.
 
     Returns
     -------
-    Node
+    Node or tuple[Node, Node]
+        The resultant node, or the rescaled node and the log-scale node if
+        ``rescale = True``.
     
     Examples
     --------
@@ -4208,6 +4223,26 @@ contract_between_node.__doc__ = \
     >>> result = nodeA @ nodeB
     >>> result.shape
     torch.Size([100, 10, 7])
+    
+    Two nodes that share the axis ``"x"`` (e.g. the ket and the bra of a
+    variable whose diagonal is wanted) and a connected edge. The result keeps
+    ``"x"`` once, and is rescaled:
+    
+    >>> net = tk.TensorNetwork()
+    >>> ket = tk.Node(tensor=torch.linspace(-1, 1, 1500).view(100, 3, 5),
+    ...               axes_names=('batch', 'x', 'right'),
+    ...               network=net)
+    >>> bra = tk.Node(tensor=torch.linspace(1, 2, 1500).view(100, 5, 3),
+    ...               axes_names=('batch', 'left', 'x'),
+    ...               network=net)
+    >>> _ = ket['right'] ^ bra['left']
+    >>> result, log_scale = ket.contract_between(bra, keep='x', rescale=True)
+    >>> result.axes_names, log_scale.axes_names
+    (['batch', 'x'], ['batch'])
+    
+    >>> value = torch.einsum('bxr,brx->bx', ket.tensor, bra.tensor)
+    >>> torch.allclose(result.tensor * log_scale.tensor.exp()[:, None], value)
+    True
     """
 
 AbstractNode.__matmul__ = contract_between_node
