@@ -3381,12 +3381,14 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
                                     axes_names=('left', 'right'),
                                     name='aux',
                                     network=self,
-                                    virtual=True)
+                                    virtual=True,
+                                    dtype=torch.float64)
                 self.node = tk.randn(shape=(4, 5),
                                      axes_names=('left', 'right'),
                                      name='node',
                                      network=self,
-                                     param_node=True)
+                                     param_node=True,
+                                     dtype=torch.float64)
                 self.aux['right'] ^ self.node['left']
 
             def contract(self):
