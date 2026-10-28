@@ -3368,7 +3368,8 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
                                      axes_names=('input', 'right'),
                                      name='node',
                                      network=self,
-                                     param_node=True)
+                                     param_node=True,
+                                     dtype=torch.float64)
 
             def set_data_nodes(self) -> None:
                 super().set_data_nodes([self.node['input']], num_batch_edges=1)
@@ -3389,7 +3390,7 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
         net = setup_several_outputs()
 
         for _ in range(2):
-            data = torch.randn(5, 1, 3)
+            data = torch.randn(5, 1, 3, dtype=torch.float64)
             expected = data[:, 0] @ net.node.tensor
 
             for _ in range(2):
@@ -3397,13 +3398,13 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
                 assert torch.allclose(result, expected)
                 assert torch.allclose(double, 2 * expected)
 
-            net.trace(torch.zeros(1, 1, 3), as_list)
+            net.trace(torch.zeros(1, 1, 3, dtype=torch.float64), as_list)
 
     def test_forward_several_outputs_grad(self, setup_several_outputs):
         net = setup_several_outputs()
-        net.trace(torch.zeros(1, 1, 3))
+        net.trace(torch.zeros(1, 1, 3, dtype=torch.float64))
 
-        data = torch.randn(5, 1, 3)
+        data = torch.randn(5, 1, 3, dtype=torch.float64)
         result, double = net(data)
         (result.sum() + double.sum()).backward()
 
@@ -3412,7 +3413,7 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
 
     def test_forward_several_outputs_reset(self, setup_several_outputs):
         net = setup_several_outputs()
-        net(torch.randn(5, 1, 3))
+        net(torch.randn(5, 1, 3, dtype=torch.float64))
         assert net._contract_outputs is not None
 
         net.reset()
