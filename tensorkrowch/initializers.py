@@ -116,7 +116,7 @@ def copy(shape: Shape,
          param_node: bool = False,
          *args,
          **kwargs) -> AbstractNode:
-     """
+     r"""
      Returns :class:`Node` or :class:`ParamNode` with a copy tensor, that is,
      a tensor filled with zeros except in the diagonal (elements
      :math:`T_{i_1 \ldots i_n}` with :math:`i_1 = \ldots = i_n`), which is
