@@ -14,8 +14,8 @@ parts:
    `reset` and `forward`.
 
 It also covers the contraction primitives that general tree contractions
-need (issue #1): legs kept once by a contraction, a contraction that rescales
-and keeps its scale, and inputs set per call (§2.9, §3, §4.6).
+need (issue #1): legs kept once by a contraction, and a contraction that
+rescales and keeps its scale (§2.9, §3, §4.6).
 
 
 ## 1. Primer
@@ -246,7 +246,7 @@ another shape in a later call, the nodes take that shape.
 - Planner code runs once per structure. Results that depend on tensor values
   belong in the kernel.
 
-### 2.9 Kept legs, rescaling and per-call inputs
+### 2.9 Kept legs and rescaling
 
 `contract_between` (and `@`, `contract_edges`) sums connected edges and keeps
 batch axes with the same name in both nodes. Two arguments extend it:
@@ -288,18 +288,6 @@ for mat in mats[1:]:
     log_scale = log_n if log_scale is None else log_scale + log_n
 return result, log_scale            # forward returns both tensors
 ```
-
-**Inputs set per call.** Data nodes are the inputs of a contraction: they are
-set in each call, freed by a traced `forward` after their last use, and kept
-by `reset`. Several sets of them can coexist in one network (e.g. one per
-contraction pattern), created directly with `tk.Node(..., data=True)` and set
-one by one with `node.tensor = t`. Only `add_data` (and `forward(data)`) set
-every data node at once, so they are not used then.
-
-When operations are called directly instead of through a traced `forward`, an
-intermediate result that is no longer needed is freed with
-`node.unset_tensor()`. The next call of the operation that created the node
-sets its tensor again.
 
 
 ## 3. Design choices
@@ -415,7 +403,7 @@ argument in backticks. They are checked at definition or at the first call,
 never in the replay.
 
 
-### Kept legs, rescaling and per-call inputs (issue #1)
+### Kept legs and rescaling (issue #1)
 
 A general tree contraction (one or two layers, each variable observed, open
 or summed) needed three things around TensorKrowch instead of with it:
@@ -423,7 +411,8 @@ or summed) needed three things around TensorKrowch instead of with it:
 1. a pairwise contraction for nodes sharing only batch legs, or a leg kept
    once (a hyperedge);
 2. a contraction that rescales and keeps its scale;
-3. per-call inputs and freeing without private API.
+3. per-call inputs and freeing without private API (moved to issue #2, see
+   below).
 
 Its own operation (`contract_rescale`, 52 lines of code) built an einsum in
 its kernel. Every variant below was implemented and run against that
@@ -472,16 +461,23 @@ contraction "with or without rescaling", as the issue's acceptance asks.
 which overflows before the entries do. The max-|entry| scale of the
 contraction does not have that problem.
 
-**Item 3: per-call inputs.**
+**Item 3 (per-call inputs) moved to issue #2**, which gives each recorded
+contraction of a network its own data nodes and inverse memory. Facts found
+here that #2 builds on:
 
-| variant | verdict |
-|---|---|
-| a public per-call input for virtual nodes | it duplicates what data nodes are, and virtual nodes are never freed by the inverse memory, so their rule would have to change |
-| data groups (`add_data(..., group=...)`) | it touches `set_data_nodes`, `unset_data_nodes`, `add_data`, `forward(data)`, the reserved `stack_data_memory` (one per group) and the models that set data nodes. A leaf edge connects to one data node, so each pattern needs its own copies of the leaves anyway |
-| data nodes created directly, set one by one (chosen) | it already works: several sets coexist, `node.tensor = t` sets them, the traced replay frees them, `reset` keeps them. What was missing is freeing intermediates when operations are called directly: `unset_tensor` now accepts resultant nodes that store their own tensor |
+- Data nodes created directly (`data=True`) can coexist in one network in
+  several sets, are set one by one with `node.tensor = t`, are freed by a
+  traced replay after their last use, and are kept by `reset`. Only
+  `add_data` (and so `forward(data)`) assumes one set.
+- Virtual nodes are never freed by the inverse memory (`erase` is `False`).
+- The public setter `node.tensor = t` checks shapes, so it costs about 3.7 µs
+  per call, against 0.2 µs for the private `_direct_set_tensor`.
 
-The public setter `node.tensor = t` checks shapes, so it costs about 3.7 µs
-per call, against 0.2 µs for the private `_direct_set_tensor`.
+Items 1 and 2 do not depend on #2. #2 depends on them in one way: it has to
+make the program state (`_seq_ops`, `_tracing`, `_traced`, the inverse
+memory) per program. With `contract_edges` on the core, nine operations write
+that state in `_build_operation`, and six node-like operations still write it
+by hand.
 
 **Acceptance.** The downstream operation becomes
 `tk.contract_between(node1, node2, keep=kept, rescale=True)`: 52 lines and
@@ -499,7 +495,6 @@ is not in the issue, so it was not measured.
 | core | `_build_operation(name, fn, key=None, runtime=(), operands=None)`, after the `Operation` class: builds `check_first`, `fn_first`, `fn_next` and registers the `Operation` |
 | decorator | `operation`, section *CUSTOM OPERATIONS*: validation, signature binding, the redefinition rules, then `_build_operation` |
 | built-ins built with the core | `permute`, `tprod`, `mul`, `div`, `add`, `sub` (shared `_elementwise_plan`, `_elementwise_key`, `_elementwise_operands`), `renormalize`, `conj`, `contract_edges` (`_contract_edges_plan`; `_contract_edges_call` makes its arguments hashable) |
-| per-call inputs | data nodes; `AbstractNode.unset_tensor` also frees resultant nodes that store their own tensor |
 | argument helpers | `_freeze_arg` (lists to tuples), `_operand_nodes` (nodes in arguments, also nested), `_runtime_values` |
 | built-in names | `_BUILTIN_OPERATIONS`, a snapshot of `TensorNetwork.operations` taken after all built-ins are defined |
 | custom names | `_CUSTOM_OPERATIONS`: name → (module, qualname) |
@@ -623,9 +618,7 @@ does not match. Batch edges admit any size.
   measures only lookup and replay: 12.1 µs on develop-unified, 13.0 µs with
   the core (15 µs before `operands`). The difference is the kernel closure.
 - Tests: `tests/test_operations.py::TestContractKeepRescale` (the issue's
-  operation as reference, the three cases, gradients, trace, errors),
-  `tests/test_components.py::TestTensorNetwork::test_unset_tensor_resultant`
-  and `test_data_nodes_per_pattern`.
+  operation as reference, the three cases, gradients, trace, errors).
 
 ### 4.7 Known issues and possible next steps
 

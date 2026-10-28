@@ -78,8 +78,8 @@ the source or by a probe; guesses are marked as such.
   have one shape), so an extra data node breaks it: use virtual nodes for
   auxiliary inputs (bm4tc names them `virtual_result_sample_*`, so `reset` deletes
   them). `virtual_uniform` nodes (uniform MPS) are left alone by `reset`.
-  (`contraction-primitives`: or data nodes created directly, set one by one, if
-  `add_data`/`forward(data)` are not used; see below.)
+  (`contraction-primitives`: data nodes created directly also coexist in
+  several sets; inputs per recorded contraction are issue #2.)
 - Setting a tensor: `node.tensor = t` for non-result nodes that own their tensor;
   `set_tensor_from(other)` makes a node read another node's memory (`node_ref`),
   which is how a bra layer can share the ket's tensors without copying.
@@ -230,7 +230,7 @@ double layers in `sample`.
 ## Since: `contraction-primitives` (issue #1, 2026-10-28)
 
 What a general tree contraction (one or two layers; observed, open or summed
-variables) needed around tensorkrowch. Variants and measurements are in
+variables) needed around tensorkrowch, items 1 and 2. Variants and measurements are in
 `docs/custom_operations.md` (§2.9 guide, §3 design, §4.6 implementation).
 
 - `contract_between(node1, node2, keep=None, rescale=False)` (and `@`,
@@ -248,11 +248,11 @@ variables) needed around tensorkrowch. Variants and measurements are in
   need a neighbour lookup in the contraction, densify if the order touches δ,
   and cannot express the batch or a variable shared by three or more factors;
   a node-level einsum, which leaves the letter bookkeeping to the caller.
-- Per-call inputs: data nodes created directly (`data=True`), one set per
-  pattern, set with `node.tensor = t` (about 3.7 µs against 0.2 µs for
-  `_direct_set_tensor`), freed by a traced forward, kept by `reset`. Do not use
-  `add_data`/`forward(data)` then. `unset_tensor()` frees resultant nodes too
-  (it was the private `_save_in_network(None)`).
+- Per-call inputs (the issue's item 3) moved to issue #2, programs per set
+  of `contract` arguments with their own data nodes. Found here: data nodes
+  created directly coexist in several sets, set with `node.tensor = t` (about
+  3.7 µs against 0.2 µs for `_direct_set_tensor`) and freed by a traced
+  replay; virtual nodes are never freed by the inverse memory.
 - `contract_edges`' successors keep the key `(edges, node1, node2)` without
   `keep`/`rescale`; their hints are now the kernel. `a @ b` costs about +1 µs
   per call in lookup and replay (12.1 → 13.0 µs on small tensors).
