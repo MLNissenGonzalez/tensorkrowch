@@ -13,6 +13,10 @@ parts:
 4. **Implementation**: where the code lives and how it interacts with `trace`,
    `reset` and `forward`.
 
+It also covers the contraction primitives that general tree contractions
+need (issue #1): legs kept once by a contraction, and a contraction that
+rescales and keeps its scale (§2.9, §3, §4.6).
+
 
 ## 1. Primer
 
@@ -242,6 +246,49 @@ another shape in a later call, the nodes take that shape.
 - Planner code runs once per structure. Results that depend on tensor values
   belong in the kernel.
 
+### 2.9 Kept legs and rescaling
+
+`contract_between` (and `@`, `contract_edges`) sums connected edges and keeps
+batch axes with the same name in both nodes. Two arguments extend it:
+
+- **`keep`**: names of other dangling axes that both nodes have, kept once in
+  the result. The contraction is element-wise along them: a hyperedge between
+  both nodes and the result, as the batch is. A typical case is the ket and
+  the bra of a two-layer contraction, when only the diagonal of an open
+  variable is wanted.
+- **`rescale=True`**: the result is divided by its largest |entry| for each
+  sample (each index of its batch axes), and the log of that scale is returned
+  as a second node, with the batch axes of the result. The scale is detached
+  and is 1 for a zero result, so `log|result| + log_scale` and its gradient are
+  exact.
+
+```python
+net = tk.TensorNetwork()
+ket = tk.randn((100, 3, 5), axes_names=('batch', 'x', 'right'), network=net)
+bra = tk.randn((100, 5, 3), axes_names=('batch', 'left', 'x'), network=net)
+ket['right'] ^ bra['left']
+
+result = tk.contract_between(ket, bra, keep='x')       # axes: batch, x
+result, log_scale = ket.contract_between(bra, keep='x', rescale=True)
+```
+
+Nodes that share only batch or kept axes contract as an outer product in the
+other axes, so `p @ q` works for `p` with axes `(batch, a)` and `q` with axes
+`(batch, b)`. Nodes that share nothing still raise a `ValueError`: `tprod` is
+the outer product.
+
+A long chain stays finite in float32 if each step is rescaled and the
+log-scales are added. This is the log-norm accumulation of §2.3 without a
+custom operation:
+
+```python
+result, log_scale = mats[0], None
+for mat in mats[1:]:
+    result, log_n = result.contract_between(mat, rescale=True)
+    log_scale = log_n if log_scale is None else log_scale + log_n
+return result, log_scale            # forward returns both tensors
+```
+
 
 ## 3. Design choices
 
@@ -356,15 +403,98 @@ argument in backticks. They are checked at definition or at the first call,
 never in the replay.
 
 
+### Kept legs and rescaling (issue #1)
+
+A general tree contraction (one or two layers, each variable observed, open
+or summed) needed three things around TensorKrowch instead of with it:
+
+1. a pairwise contraction for nodes sharing only batch legs, or a leg kept
+   once (a hyperedge);
+2. a contraction that rescales and keeps its scale;
+3. per-call inputs and freeing without private API (moved to issue #2, see
+   below).
+
+Its own operation (`contract_rescale`, 52 lines of code) built an einsum in
+its kernel. Every variant below was implemented and run against that
+operation as reference: values and gradients at rtol 1e-12 in float64 and
+complex128, for two nodes sharing only a batch, a kept leg plus a summed
+edge, and a chain of 40 rescaled contractions that overflows in float32
+unscaled; plus `trace`, replay and reuse of resultant nodes.
+
+**Item 1: how a contraction knows which legs to keep.**
+
+| variant | correct | existing behaviour | user code (lines) | what the user must know |
+|---|---|---|---|---|
+| (a) naming convention: dangling axes with equal names are kept | yes | **breaks**: 710 failures in the existing suite (636 in `TestMPO`) | 1 | that names decide the contraction |
+| (b) explicit `keep=` on `contract_between` (chosen) | yes | unchanged | 5 (1 when the caller knows the names) | `keep`, `rescale` |
+| (b2) node-level `einsum` with kept letters | yes | unchanged | 42 | einsum subscripts, a separate rescaling operation |
+| (c) copy (δ) nodes found by the contraction | yes | unchanged | 9 | copy nodes, a node flag, the ket/bra/out wiring, the dtype and device of δ |
+
+- **(a)** cannot be made safe. Two nodes with a dangling `input` leg, which is
+  every pair of MPS and MPO sites, turn from an outer product (`input_0`,
+  `input_1`) into a diagonal. A reserved word in the name (as `batch` is) or a
+  per-axis flag would avoid breaking existing code, but they still pair legs
+  by name equality, and names collide by construction across sites. The
+  decision would stay hidden at the call site.
+- **(c)** keeps the edge scheme and expresses hyperedges the standard way, but
+  the contraction has to look at the operands' neighbours, which is the
+  special case the issue warned about. If the contraction order reaches δ
+  directly (`p @ δ`), it is a dense d³ tensor: 30,000 entries where `p` had
+  600. A δ with four legs (a variable shared by three factors) is not
+  identified at all, and supporting it would need rewriting δ into a smaller
+  δ' during contraction. The batch cannot become a copy node without that
+  rewriting either, so it would stay a name rule.
+- **(b2)** is correct and explicit, but the caller still assigns a letter to
+  every leg. That is most of the downstream code, so it is not simpler.
+- **(b)** turns the existing batch mechanism (the `bmm` batch dimension) into
+  the general one: the kept set is the shared batch axes plus `keep`, with no
+  new path. Batch legs stay kept by default, so nothing existing changes.
+
+**Item 2: rescaling.** `rescale=True` on the same contraction (chosen)
+against a separate `rescale(node)` operation composed after `@`. Their values
+are identical, and timing them on a traced chain of 200 contractions (batch
+256, bond 20) does not separate them (55–62 ms, within the noise between
+rounds). The separate operation keeps one more resultant node per step (795
+against 596) and is one more thing to compose. The option makes it one
+contraction "with or without rescaling", as the issue's acceptance asks.
+`renormalize` does not return its log-norm: its norm is a sum of squares,
+which overflows before the entries do. The max-|entry| scale of the
+contraction does not have that problem.
+
+**Item 3 (per-call inputs) moved to issue #2**, which gives each recorded
+contraction of a network its own data nodes and inverse memory. Facts found
+here that #2 builds on:
+
+- Data nodes created directly (`data=True`) can coexist in one network in
+  several sets, are set one by one with `node.tensor = t`, are freed by a
+  traced replay after their last use, and are kept by `reset`. Only
+  `add_data` (and so `forward(data)`) assumes one set.
+- Virtual nodes are never freed by the inverse memory (`erase` is `False`).
+- The public setter `node.tensor = t` checks shapes, so it costs about 3.7 µs
+  per call, against 0.2 µs for the private `_direct_set_tensor`.
+
+Items 1 and 2 do not depend on #2. #2 depends on them in one way: it has to
+make the program state (`_seq_ops`, `_tracing`, `_traced`, the inverse
+memory) per program. With `contract_edges` on the core, nine operations write
+that state in `_build_operation`, and six node-like operations still write it
+by hand.
+
+**Acceptance.** The downstream operation becomes
+`tk.contract_between(node1, node2, keep=kept, rescale=True)`: 52 lines and
+five concepts (`tk.operation`, the planner/kernel split, einsum letters, the
+axes specification, detaching) become one call with two arguments of a
+function users already know. The issue also names `log_abs_phase`, whose code
+is not in the issue, so it was not measured.
+
 ## 4. Implementation
 
 ### 4.1 Where the code lives
 
 | what | where |
 |---|---|
-| core | `_build_operation(name, fn, key=None, runtime=())`, after the `Operation` class: builds `check_first`, `fn_first`, `fn_next` and registers the `Operation` |
+| core | `_build_operation(name, fn, key=None, runtime=(), operands=None)`, after the `Operation` class: builds `check_first`, `fn_first`, `fn_next` and registers the `Operation` |
 | decorator | `operation`, section *CUSTOM OPERATIONS*: validation, signature binding, the redefinition rules, then `_build_operation` |
-| built-ins built with the core | `permute`, `tprod`, `mul`, `div`, `add`, `sub` (shared `_elementwise_plan`, `_elementwise_key`), `renormalize`, `conj` |
+| built-ins built with the core | `permute`, `tprod`, `mul`, `div`, `add`, `sub` (shared `_elementwise_plan`, `_elementwise_key`, `_elementwise_operands`), `renormalize`, `conj`, `contract_edges` (`_contract_edges_plan`; `_contract_edges_call` makes its arguments hashable) |
 | argument helpers | `_freeze_arg` (lists to tuples), `_operand_nodes` (nodes in arguments, also nested), `_runtime_values` |
 | built-in names | `_BUILTIN_OPERATIONS`, a snapshot of `TensorNetwork.operations` taken after all built-ins are defined |
 | custom names | `_CUSTOM_OPERATIONS`: name → (module, qualname) |
@@ -466,15 +596,39 @@ does not match. Batch edges admit any size.
   18.6–18.8 / 58.0–61.2 ms, within noise. The B prototype took
   17.8–17.9 / 58.1–58.3 ms.
 
-### 4.6 Known issues and possible next steps
+### 4.6 `contract_edges` on the core: kept legs and rescaling
+
+- `_contract_edges_plan(edges, node1, node2, keep=(), rescale=False)` does
+  what `_contract_edges_first` did once: it validates, classifies each axis as
+  contracted, kept or free, and computes the permutations and the
+  `shape_limits` of the `bmm`. Kept axes are the batch axes with the same name
+  in both nodes plus `keep`. They form the `bmm` batch dimension, as batch
+  axes did, and come first in the result. The trace (`node1 is node2`) is a
+  sequence of `diagonal` and `sum`, as before.
+- With `rescale`, the kernel divides by the detached max-|entry| over the
+  non-batch axes of the result, and returns the log-scale. The axes are
+  `(out_axes, batch axes of out_axes)`, so the log-scale is a `StackNode` for
+  stacks and has no axes without batch.
+- `_contract_edges_call` turns `edges` and `keep` into tuples, and passes
+  `keep` and `rescale` only when given. So the successor key without them is
+  `(edges, node1, node2)`, as tests and the `Successor` docstring rely on.
+- `operands(*args)` gives the core the nodes of the arguments without
+  searching them (`isinstance` against the abstract `AbstractNode` costs
+  about 0.5 µs per argument). Per call of `a @ b` on small tensors, which
+  measures only lookup and replay: 12.1 µs hand-written, 13.0 µs with
+  the core (15 µs before `operands`). The difference is the kernel closure.
+- Tests: `tests/test_operations.py::TestContractKeepRescale` (the issue's
+  operation as reference, the three cases, gradients, trace, errors).
+
+### 4.7 Known issues and possible next steps
 
 - Creating a leaf node whose name is an operation name (built-in or custom),
   e.g. `tk.randn((2,), name='renormalize')`, raises a `RecursionError` in
   `TensorNetwork._assign_node_name` instead of its `ValueError`. Renaming a
   node raises the `ValueError` correctly. This predates this change.
-- The node-like built-ins (`split`, `contract_edges`, `merge_edges`,
-  `split_edge`, `stack`, `unbind`, `einsum`) still write their own
-  bookkeeping. They create several nodes with new connected edges, or share
+- The node-like built-ins (`split`, `merge_edges`, `split_edge`, `stack`,
+  `unbind`, `einsum`) still write their own bookkeeping. They create several
+  nodes with new connected edges, or share
   memory between nodes, which the core does not describe yet.
 - A shorthand for the common "same axes as the first node" output could be
   added if it proves frequent.
