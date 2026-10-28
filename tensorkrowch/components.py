@@ -24,11 +24,12 @@ This script contains:
 """
 
 import copy
+import functools
 import inspect
 import warnings
 from abc import abstractmethod, ABC
 from typing import (overload,
-                    Any, Dict, List, Optional,
+                    Any, Callable, Dict, List, Optional,
                     Sequence, Text, Tuple, Union)
 
 import torch
@@ -522,7 +523,7 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         self._edges = []
         self._name = name
         self._network = network
-        self._successors = dict()
+        self._successor_caches = dict()  # Program -> successors (see below)
 
         # Set node type
         if not hasattr(self, '_leaf'):
@@ -693,8 +694,26 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         dictionaries of :class:`Successors <Successor>` of the node as values.
         The inner dictionaries use as keys the arguments used when the
         operation was called.
+        
+        Each :class:`Program` of the network has its own successors, so that
+        programs never share resultant nodes. These are the successors of the
+        operations called outside programs (or of the program being called).
         """
         return self._successors
+
+    @property
+    def _successors(self) -> Dict[Text, Dict[Any, 'Successor']]:
+        """Successors in the program of the network that is being called."""
+        program = None if self._network is None else self._network._program
+        successors = self._successor_caches.get(program)
+        if successors is None:
+            successors = self._successor_caches[program] = dict()
+        return successors
+
+    @_successors.setter
+    def _successors(self, successors: Dict[Text, Dict[Any, 'Successor']]):
+        program = None if self._network is None else self._network._program
+        self._successor_caches[program] = successors
 
     @property
     def name(self) -> Text:
@@ -1675,15 +1694,14 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         all addresses accessed are already in the ``inverse_memory``.
         """
         net = self._network
-        address = node_ref._tensor_info['address']
 
         # When contracting network, if it is traced, we keep track of the number
         # of accesses to "erasable" nodes
-        aux_dict = net._inverse_memory[address]
+        aux_dict = net._inverse_memory[node_ref]
         aux_dict['re-accessed'] += 1
         if aux_dict['accessed'] == aux_dict['re-accessed']:
             if aux_dict['erase']:
-                net._memory_nodes[address] = None
+                net._memory_nodes[node_ref._tensor_info['address']] = None
             aux_dict['re-accessed'] = 0
 
     def _record_in_inverse_memory(self):
@@ -1706,18 +1724,15 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         erased, then its tensor is indeed replaced by ``None``.
         """
         net = self._network
-        address = self._tensor_info['address']
-        if address is None:
-            node_ref = self._tensor_info['node_ref']
-            address = node_ref._tensor_info['address']
-            check_nodes = [self, node_ref]
-        else:
-            check_nodes = [self]
+        # Keyed by the node storing the memory, not by its address (name),
+        # which changes when nodes are renamed
+        node_ref = self.node_ref()
+        check_nodes = [self] if node_ref is self else [self, node_ref]
         
         # When tracing network, node is recorded in inverse memory
-        if address in net._inverse_memory:
-            if net._inverse_memory[address]['erase']:
-                net._inverse_memory[address]['accessed'] += 1
+        if node_ref in net._inverse_memory:
+            if net._inverse_memory[node_ref]['erase']:
+                net._inverse_memory[node_ref]['accessed'] += 1
         else:
             # Node can only be erased if both itself and the node from which
             # it is taking the tensor information (node_ref) are resultant or
@@ -1727,7 +1742,7 @@ class AbstractNode(ABC):  # MARK: AbstractNode
                 erase &= node.is_resultant() or node._data or \
                     (node._virtual and node._name == 'stack_data_memory')
 
-            net._inverse_memory[address] = {
+            net._inverse_memory[node_ref] = {
                 'accessed': 1,
                 're-accessed': 0,
                 'erase': erase}
@@ -4089,19 +4104,21 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
 
         # Memories
         self._memory_nodes = dict()    # address -> memory
-        self._inverse_memory = dict()  # address -> nodes using that memory
 
         # TN modes
         # Auto-management of memory mode
         self._auto_stack = True   # train -> True / eval -> True
         self._auto_unbind = False  # train -> False / eval -> True
-        self._tracing = False      # Tracing mode (True while calling .trace())
-        self._traced = False       # True if .trace() is called, False if reset()
 
-        # Lis of operations used to contract the TN
-        self._seq_ops = []
-        self._contract_args = None
-        self._contract_outputs = None  # Nodes returned by contract, if several
+        # Programs: recorded contractions (see Program). Operations called
+        # outside programs are recorded in ``_eager``, which is never replayed.
+        # ``_program`` is the one being called
+        self._eager = Program._eager_state(self)
+        self._program = self._eager
+        self._programs = dict()  # contract arguments -> Program
+        self._max_programs = 1
+        self._generation = 0     # increased by reset, which deletes programs
+        self._last_program = None
 
     # ----------
     # Properties
@@ -4151,6 +4168,83 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
     def resultant_nodes(self) -> Dict[Text, AbstractNode]:
         """Returns dictionary of ``resultant`` nodes of the network."""
         return self._resultant_nodes
+
+    @property
+    def max_programs(self) -> Optional[int]:
+        """
+        Number of :class:`Programs <Program>` (one per set of arguments of
+        :meth:`contract`) the network keeps, ``1`` by default; ``None`` keeps
+        all of them until :meth:`reset`.
+        
+        When :meth:`forward` is called with arguments of :meth:`contract` for
+        which there is no program and the network keeps ``max_programs``
+        already, the network is :meth:`reset` (with a warning) and the new
+        program is recorded. Programs are only freed together, by
+        :meth:`reset`.
+        
+        Raises
+        ------
+        TypeError
+            If it is set to something other than an int or ``None``.
+        ValueError
+            If it is set to an int smaller than 1.
+        """
+        return self._max_programs
+
+    @max_programs.setter
+    def max_programs(self, max_programs: Optional[int]) -> None:
+        if max_programs is not None:
+            if isinstance(max_programs, bool) or \
+                    not isinstance(max_programs, int):
+                raise TypeError('`max_programs` should be int type or None')
+            if max_programs < 1:
+                raise ValueError('`max_programs` should be at least 1')
+        self._max_programs = max_programs
+        if (max_programs is not None) and (len(self._programs) > max_programs):
+            self.reset()
+
+    def _full(self) -> bool:
+        """Whether the network keeps ``max_programs`` programs (or more)."""
+        return (self._max_programs is not None) and \
+            (len(self._programs) >= self._max_programs)
+
+    # State of the program being called, reached by the operations
+    @property
+    def _seq_ops(self) -> List[Tuple[Text, Tuple]]:
+        return self._program._seq_ops
+
+    @_seq_ops.setter
+    def _seq_ops(self, seq_ops: List[Tuple[Text, Tuple]]) -> None:
+        self._program._seq_ops = seq_ops
+
+    @property
+    def _inverse_memory(self) -> Dict['AbstractNode', Dict[Text, Any]]:
+        return self._program._inverse_memory
+
+    @_inverse_memory.setter
+    def _inverse_memory(self,
+                        inverse_memory: Dict['AbstractNode',
+                                             Dict[Text, Any]]) -> None:
+        self._program._inverse_memory = inverse_memory
+
+    @property
+    def _tracing(self) -> bool:
+        """Whether a program is being recorded (operations record their
+        operands in the program's inverse memory)."""
+        return self._program._recording
+
+    @_tracing.setter
+    def _tracing(self, tracing: bool) -> None:
+        self._program._recording = tracing
+
+    @property
+    def _traced(self) -> bool:
+        """Whether the program being called frees its intermediate tensors."""
+        return self._program._traced
+
+    @_traced.setter
+    def _traced(self, traced: bool) -> None:
+        self._program._traced = traced
 
     @property
     def edges(self) -> List[Edge]:
@@ -4403,10 +4497,6 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                 self._memory_nodes[new_name] = self._memory_nodes.pop(
                     prev_name)
                 node._tensor_info['address'] = new_name
-
-                if self._tracing and (prev_name in self._inverse_memory):
-                    self._inverse_memory[new_name] = self._inverse_memory.pop(
-                        prev_name)
 
         # This would be the case in the example above, where the original
         # "node_0" will be replaced by the original "node_1", and hence the
@@ -4940,22 +5030,25 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
           network.
         
         Also, the dictionaries of :class:`Successors <Successor>` of all ``leaf``
-        and ``data`` nodes are emptied.
+        and ``data`` nodes are emptied, and all :class:`Programs <Program>`
+        are deleted (a program made with ``Program(net, fn)`` is recorded
+        again in its next call).
         
         The :class:`TensorNetwork` is automatically ``reset`` when
         :meth:`parameterizing <parameterize>` it, changing :meth:`auto_stack`
-        or :meth:`auto_unbind` modes, or :meth:`tracing <trace>`.
+        or :meth:`auto_unbind` modes, or when it keeps :attr:`max_programs`
+        programs already and another one is recorded (by :meth:`forward` or
+        :meth:`trace`).
         
         See :class:`AbstractNode` to learn more about the **4 types** of nodes
         and the **reserved names**.
         
         For an example, check this :ref:`tutorial <tutorial_5>`.
         """
-        self._traced = False
-        self._seq_ops = []
-        self._contract_args = None
-        self._contract_outputs = None
-        self._inverse_memory = dict()
+        self._programs = dict()
+        self._generation += 1
+        self._eager._clear()
+        self._last_program = None
 
         if self._resultant_nodes or self._virtual_nodes:
             aux_dict = dict()
@@ -4965,7 +5058,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
             for node in aux_dict.values():
                 # Successors point to resultant nodes, deleted below. Also
                 # those of virtual nodes that are kept
-                node._successors = dict()
+                node._successor_caches = dict()
                 
                 if node._virtual and ('virtual_result' not in node._name):
                     # Virtual nodes named "virtual_result" are nodes that are
@@ -5001,7 +5094,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                     node._temp_tensor = None
 
             for node in list(self._data_nodes.values()):
-                node._successors = dict()
+                node._successor_caches = dict()
 
             aux_dict = dict()
             aux_dict.update(self._resultant_nodes)
@@ -5032,6 +5125,11 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         is contracted with some input data, an example tensor with batch dimension
         1 and filled with zeros would be enough to trace the contraction.
         
+        What is traced is the :class:`Program` of these arguments. If the
+        network keeps :attr:`max_programs` programs already (with the default,
+        one), it is :meth:`reset` first. Otherwise, the other programs are
+        kept, so that several of them can be traced.
+        
         For an example, check this :ref:`tutorial <tutorial_5>`.
 
         Parameters
@@ -5046,20 +5144,101 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         kwargs :
             Keyword arguments that might be used in :meth:`contract`.
         """
-        self.reset()
+        if self._full():
+            self.reset()
         
-        self._tracing = True
+        # Through ``self``, which subclasses may override, as in forward. The
+        # program is recorded (or replayed if it already was)
+        self._last_program = None
         self(example, *args, **kwargs)
-        self._tracing = False
-        self(example, *args, **kwargs)
-        self._traced = True
+        if self._last_program is None:
+            raise ValueError('`forward` did not call a program of the network '
+                             '(see `program`), so there is nothing to trace')
+        self._last_program._traced = True
 
-    def _normalize_contract_args(self,
-                                 *args: Any,
-                                 **kwargs: Any) -> Dict[Text, Any]:
+    def _contract_key(self, *args: Any, **kwargs: Any) -> Tuple:
+        """The arguments of :meth:`contract`, normalised (with their defaults)
+        and hashable, which identify a :class:`Program` of the network."""
         bound = inspect.signature(self.contract).bind(*args, **kwargs)
         bound.apply_defaults()
-        return dict(bound.arguments)
+        key = tuple((name, _hashable_arg(value))
+                    for name, value in bound.arguments.items())
+        try:
+            hash(key)
+        except TypeError:
+            raise TypeError('Arguments of `contract` should be hashable '
+                            '(lists, tuples, dicts and sets of hashable '
+                            'objects are also valid)')
+        return key
+
+    def program(self, *args, **kwargs) -> 'Program':
+        """
+        Returns the :class:`Program` that contracts the network with
+        :meth:`contract` called with these arguments, made if the network does
+        not have it. :meth:`forward` calls it.
+        
+        If the network keeps :attr:`max_programs` programs already, it is
+        :meth:`reset` before making a new one, with a warning.
+
+        Parameters
+        ----------
+        args :
+            Arguments of :meth:`contract`.
+        kwargs :
+            Keyword arguments of :meth:`contract`.
+
+        Returns
+        -------
+        Program
+        
+        Examples
+        --------
+        >>> mps = tk.models.MPS(n_sites=5, phys_dim=2, bond_dim=4,
+        ...                     init_method='randn_eye', std=1e-9)
+        >>> mps.max_programs = None
+        >>> data = torch.rand(10, 5, 2)
+        >>> plain = mps.program()
+        >>> inline = mps.program(inline_input=True)
+        >>> torch.allclose(plain(data), inline(data))
+        True
+        
+        :meth:`forward` replays the same programs:
+        
+        >>> mps(data, inline_input=True) is not None
+        True
+        >>> len(mps._programs)
+        2
+        """
+        key = self._contract_key(*args, **kwargs)
+        program = self._programs.get(key)
+        if program is None:
+            if self._full():
+                warnings.warn(
+                    'Arguments of contract have changed, and the network '
+                    'keeps `max_programs` programs already. The tensor '
+                    'network has been reset, but not traced again. Consider '
+                    'calling trace if you want to keep the optimized '
+                    'contraction path, or raising `max_programs` to keep '
+                    'several programs')
+                self.reset()
+            program = Program(self, functools.partial(self.contract,
+                                                      *args, **kwargs))
+            self._programs[key] = program
+        return program
+
+    def _add_data_or_set_nodes(self,
+                               data: Union[Tensor, Sequence[Tensor]]) -> None:
+        """Adds ``data`` to the data nodes, setting them if there are none."""
+        if not self._data_nodes:
+            try:
+                self.set_data_nodes()
+            except TypeError:
+                raise TypeError(
+                    'set_data_nodes missing 2 required positional arguments:'
+                    ' `input_edges` and `num_batch_edges`. Override method'
+                    ' with no arguments in subclasses of TensorNetwork or '
+                    'call set_data_nodes explicitly before forward')
+        self.add_data(data=data)
 
     def contract(self) -> Union[Node, Tuple[Node, ...]]:
         """
@@ -5079,7 +5258,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
     def forward(self,
                 data: Optional[Union[Tensor, Sequence[Tensor]]] = None,
                 *args,
-                **kwargs) -> Tensor:
+                **kwargs) -> Union[Tensor, Tuple[Tensor, ...]]:
         r"""
         Contracts :class:`TensorNetwork` with input data. It can be called using
         the ``__call__`` operator ``()``.
@@ -5091,14 +5270,16 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         single ``torch.Tensor``.
         
         Furthermore, to optimize the contraction algorithm during training,
-        once the :class:`TensorNetwork` is :meth:`traced <trace>`, all that
-        ``forward`` does is calling the different :class:`Operations <Operation>`
-        used in :meth:`contract` in the same order they appeared in the code.
-        Hence, the **last operation** in :meth:`contract` should be the one that
-        **returns the single output** :class:`Node`.
+        the first call records the :class:`Operations <Operation>` used in
+        :meth:`contract`, and the next calls with the same arguments only
+        replay them: ``forward`` is ``self.program(*args, **kwargs)(data)``
+        (see :meth:`program` and :class:`Program`). Each set of arguments has
+        its own program, and the network keeps up to :attr:`max_programs` of
+        them (one by default: then, calling ``forward`` with other arguments
+        resets the network, with a warning).
         
-        If :meth:`contract` returns a tuple of nodes instead, ``forward``
-        returns a tuple with their tensors, and these nodes can come from any
+        If :meth:`contract` returns a tuple of nodes, ``forward`` returns a
+        tuple with their tensors, and these nodes can come from any
         operation. Their tensors are not erased from memory after the
         contraction, even if they are used in later operations.
         
@@ -5132,63 +5313,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         -------
         torch.Tensor or tuple[torch.Tensor]
         """
-        if data is not None:
-            if not self._data_nodes:
-                try:
-                    self.set_data_nodes()
-                except TypeError:
-                    raise TypeError(
-                        'set_data_nodes missing 2 required positional arguments:'
-                        ' `input_edges` and `num_batch_edges`. Override method'
-                        ' with no arguments in subclasses of TensorNetwork or '
-                        'call set_data_nodes explicitly before forward')
-            self.add_data(data=data)
-
-        if not self._resultant_nodes:
-            self._contract_args = self._normalize_contract_args(*args, **kwargs)
-            output = self.contract(*args, **kwargs)
-            if not isinstance(output, (tuple, list)):
-                return output.tensor
-            
-            if not output or \
-                    any([not isinstance(node, AbstractNode) for node in output]):
-                raise TypeError('`contract` should return a node or a tuple '
-                                'of nodes')
-            self._contract_outputs = tuple(output)
-            
-            # Outputs cannot be erased when re-accessed in later operations
-            if self._tracing:
-                for node in self._contract_outputs:
-                    address = node.tensor_address()
-                    if address in self._inverse_memory:
-                        self._inverse_memory[address]['erase'] = False
-            
-            return tuple(node.tensor for node in self._contract_outputs)
-
-        else:
-            contract_args = self._normalize_contract_args(*args, **kwargs)
-            if contract_args != self._contract_args:
-                warnings.warn(
-                    'Arguments of contract have changed. The tensor network '
-                    'has been reset, but not traced again. Consider calling '
-                    'trace if you want to keep the optimized contraction path')
-                self.reset()
-                return self.forward(data, *args, **kwargs)
-
-            output = list(map(lambda op: self.operations[op[0]](*op[1]),
-                              self._seq_ops))[-1]
-            
-            if self._contract_outputs is not None:
-                return tuple(node.tensor for node in self._contract_outputs)
-
-            if not isinstance(output, Node):
-                if (self._seq_ops[-1][0] == 'unbind') and (len(output) == 1):
-                    output = output[0]
-                else:
-                    raise ValueError('The last operation should be the one '
-                                     'returning a single resultant node')
-
-            return output.tensor
+        return self.program(*args, **kwargs)(data)
 
     def __getitem__(self, key: Union[int, Text]) -> Union[Edge, AbstractNode]:
         if isinstance(key, int):
@@ -5211,3 +5336,184 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                f'\tname: {self.name}\n' \
                f'\tnodes: \n{tab_string(print_list(list(self.nodes.keys())), 2)}\n' \
                f'\tedges:\n{tab_string(print_list(self._edges), 2)})'
+
+
+def _hashable_arg(arg: Any) -> Any:
+    """Lists, tuples, dicts and sets of ``arg``, recursively, as tuples and
+    frozensets, so that arguments of ``contract`` can be keys of programs."""
+    if isinstance(arg, (list, tuple)):
+        return tuple(map(_hashable_arg, arg))
+    if isinstance(arg, dict):
+        return tuple((key, _hashable_arg(value)) for key, value in arg.items())
+    if isinstance(arg, (set, frozenset)):
+        return frozenset(map(_hashable_arg, arg))
+    return arg
+
+
+###############################################################################
+#                                   PROGRAM                                   #
+###############################################################################
+class Program:  # MARK: Program
+    """
+    Operations recorded from one call of ``fn``, which contracts nodes of
+    ``network``, and replayed in the next calls.
+    
+    The first call runs ``fn`` and records the :class:`Operations
+    <Operation>` it calls, which create ``resultant`` nodes. The next calls
+    replay them: each operation computes its tensors into the nodes it
+    created, without running ``fn``, so the Python code around the
+    operations, and the search of their cached results, is not repeated.
+    
+    A program reads the tensors that its nodes hold when it is called, as a
+    recorded computation reads its input buffers: ``data`` nodes, set by
+    ``program(data)``, ``leaf`` nodes (the parameters), and any other node
+    whose tensor is set (e.g. with :meth:`~AbstractNode.set_tensor`) before
+    the call, such as ``virtual`` nodes that ``fn`` creates as inputs.
+    
+    Each program has its own resultant nodes (operations do not share
+    results across programs), and, once :meth:`TensorNetwork.trace` makes it
+    free them, it erases its intermediate tensors in every call, as soon as
+    the program does not use them anymore. So several programs can contract
+    the same nodes in different ways, e.g. :meth:`TensorNetwork.forward`
+    with different arguments of :meth:`~TensorNetwork.contract`, each one
+    replayed by :meth:`TensorNetwork.program`.
+    
+    :meth:`TensorNetwork.reset` deletes the nodes of all programs; a program
+    is recorded again in its next call.
+    
+    Parameters
+    ----------
+    network : TensorNetwork
+        Network whose nodes ``fn`` contracts.
+    fn : callable
+        Function with no arguments that calls operations on nodes of
+        ``network`` and returns the resultant node, or a tuple of nodes. A
+        call returns their tensors.
+    
+    Examples
+    --------
+    >>> net = tk.TensorNetwork()
+    >>> nodeA = tk.randn(shape=(2, 3), axes_names=('left', 'right'),
+    ...                  network=net)
+    >>> nodeB = tk.randn(shape=(3, 4), axes_names=('left', 'right'),
+    ...                  network=net)
+    >>> _ = nodeA['right'] ^ nodeB['left']
+    >>> program = tk.Program(net, lambda: nodeA @ nodeB)
+    >>> result = program()                     # records nodeA @ nodeB
+    >>> nodeA.tensor = torch.randn(2, 3)
+    >>> torch.allclose(program(), nodeA.tensor @ nodeB.tensor)  # replays
+    True
+    """
+
+    def __init__(self, network: TensorNetwork, fn: Callable) -> None:
+        if not isinstance(network, TensorNetwork):
+            raise TypeError('`network` should be TensorNetwork type')
+        if not callable(fn):
+            raise TypeError('`fn` should be callable')
+        self._network = network
+        self._fn = fn
+        self._clear()
+
+    @classmethod
+    def _eager_state(cls, network: TensorNetwork) -> 'Program':
+        """State of the operations called outside programs: never replayed."""
+        program = cls.__new__(cls)
+        program._network = network
+        program._fn = None
+        program._clear()
+        return program
+
+    def _clear(self) -> None:
+        self._seq_ops = []          # (operation name, args), as recorded
+        self._steps = None          # (fn_next, successor, args) to replay
+        self._outputs = None        # nodes returned by fn
+        self._single = True         # whether fn returns a node, not a tuple
+        self._inverse_memory = dict()
+        self._recording = False
+        self._traced = False
+        self._generation = None     # network's generation when recorded
+
+    @property
+    def network(self) -> TensorNetwork:
+        """Network whose nodes the program contracts."""
+        return self._network
+
+    def __call__(self,
+                 data: Optional[Union[Tensor, Sequence[Tensor]]] = None
+                 ) -> Union[Tensor, Tuple[Tensor, ...]]:
+        """
+        Adds ``data`` to the network's ``data`` nodes (if it is given, see
+        :meth:`TensorNetwork.forward`) and runs the program: records it in the
+        first call (and after a :meth:`~TensorNetwork.reset`), replays it in
+        the next ones.
+
+        Returns
+        -------
+        torch.Tensor or tuple[torch.Tensor]
+            Tensor(s) of the node(s) returned by ``fn``.
+        
+        Raises
+        ------
+        ValueError
+            If it is called while another program of the network is being
+            recorded (its operations would not be part of the recording).
+        """
+        net = self._network
+        if net._program is not net._eager:
+            raise ValueError('A program cannot be called while another '
+                             'program of the network is being recorded')
+        if data is not None:
+            net._add_data_or_set_nodes(data)
+        
+        net._program = self
+        net._last_program = self
+        try:
+            if self._generation != net._generation:
+                self._record()
+            else:
+                for fn_next, successor, args in self._steps:
+                    fn_next(successor, *args)
+        finally:
+            net._program = net._eager
+        
+        if self._single:
+            return self._outputs[0].tensor
+        return tuple(node.tensor for node in self._outputs)
+
+    def _record(self) -> None:
+        net = self._network
+        self._clear()
+        self._generation = net._generation
+        
+        self._recording = True
+        try:
+            output = self._fn()
+            self._single = not isinstance(output, (tuple, list))
+            outputs = (output,) if self._single else tuple(output)
+            if not outputs or \
+                    any([not isinstance(node, AbstractNode)
+                         for node in outputs]):
+                raise TypeError('`contract` (or `fn` of a Program) should '
+                                'return a node or a tuple of nodes')
+        except BaseException:
+            # A partial recording is dropped, so that the next call records
+            # the program again from the start
+            for node in net.nodes.values():
+                node._successor_caches.pop(self, None)
+            self._clear()
+            raise
+        finally:
+            self._recording = False
+        
+        # Outputs cannot be erased when re-accessed in later operations
+        for node in outputs:
+            if node.node_ref() in self._inverse_memory:
+                self._inverse_memory[node.node_ref()]['erase'] = False
+        self._outputs = outputs
+        
+        # Successors are found once, so that replaying does not search them
+        operations = TensorNetwork.operations
+        self._steps = [(operations[name].fn_next,
+                        operations[name].check_first(*args),
+                        args)
+                       for name, args in self._seq_ops]

@@ -17,7 +17,10 @@ This script contains tests for components:
     * TestCopy
     * TestStack
     * TestTensorNetwork
+    * TestProgram
 """
+
+import warnings
 
 import pytest
 
@@ -3463,10 +3466,10 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
     def test_forward_several_outputs_reset(self, setup_several_outputs):
         net = setup_several_outputs()
         net(torch.randn(5, 1, 3, dtype=torch.float64))
-        assert net._contract_outputs is not None
+        assert len(net._programs) == 1
 
         net.reset()
-        assert net._contract_outputs is None
+        assert net._programs == dict()
         assert net.resultant_nodes == dict()
 
     def test_forward_several_outputs_error(self):
@@ -3576,3 +3579,258 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
         for node in net.resultant_nodes.values():
             assert node._tensor_info['node_ref'] is None
             assert node._tensor_info['address'] is not None
+
+
+class TestProgram:  # MARK: TestProgram
+    
+    class ChainTN(tk.TensorNetwork):
+        """Three parameters contracted with data, from the left or from the
+        right: both orders start with the same operations on the same nodes."""
+
+        def __init__(self, dtype):
+            super().__init__(name='chain_tn')
+            shapes = [(3, 2), (2, 3, 2), (2, 3)]
+            names = [('input', 'right'), ('left', 'input', 'right'),
+                     ('left', 'input')]
+            self.params = [tk.randn(shape=shape,
+                                    axes_names=axes,
+                                    name='node',
+                                    network=self,
+                                    param_node=True,
+                                    dtype=dtype)
+                           for shape, axes in zip(shapes, names)]
+            for left, right in zip(self.params[:-1], self.params[1:]):
+                left['right'] ^ right['left']
+
+        def set_data_nodes(self) -> None:
+            super().set_data_nodes([node['input'] for node in self.params],
+                                   num_batch_edges=1)
+
+        def contract(self, from_left: bool = True, scale: float = 1.):
+            nodes = [node @ node.neighbours('input') for node in self.params]
+            if from_left:
+                result = (nodes[0] @ nodes[1]) @ nodes[2]
+            else:
+                result = nodes[0] @ (nodes[1] @ nodes[2])
+            return result if scale == 1. else result * scale
+
+        def dense(self, data):
+            tensors = [node.tensor for node in self.params]
+            return torch.einsum('ar,rbs,sc,za,zb,zc->z', *tensors,
+                                data[:, 0], data[:, 1], data[:, 2])
+    
+    @pytest.mark.parametrize('dtype', [torch.float64, torch.complex128])
+    def test_alternating_programs(self, dtype):
+        net = self.ChainTN(dtype)
+        net.max_programs = None
+        
+        n_resultant = []
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')  # No reset, no warning
+            for i in range(6):
+                data = torch.randn(5, 3, 3, dtype=dtype)
+                from_left = (i % 2 == 0)
+                result = net(data, from_left)
+                assert torch.allclose(result, net.dense(data))
+                
+                # Gradients equal those of a fresh contraction
+                loss = (result.abs() ** 2).sum()
+                expected = (net.dense(data).abs() ** 2).sum()
+                params = [node.tensor for node in net.params]
+                grads = torch.autograd.grad(loss, params)
+                expected_grads = torch.autograd.grad(expected, params)
+                for grad, expected_grad in zip(grads, expected_grads):
+                    assert torch.allclose(grad, expected_grad)
+                
+                n_resultant.append(len(net.resultant_nodes))
+        
+        assert len(net._programs) == 2
+        # Nodes are created only while recording each program
+        assert n_resultant[1:] == [n_resultant[1]] * 5
+    
+    def test_alternating_programs_mps(self):
+        mps = tk.models.MPS(n_sites=6,
+                            phys_dim=3,
+                            bond_dim=4,
+                            in_features=[0, 1, 3, 4],
+                            init_method='randn_eye',
+                            std=0.1,
+                            dtype=torch.float64)
+        mps.max_programs = None
+        
+        cases = [dict(), dict(marginalize_output=True), dict(inline_input=True)]
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            for _ in range(2):
+                data = torch.rand(7, 4, 3, dtype=torch.float64)
+                for case in cases:
+                    fresh_mps = mps.copy(share_tensors=True)
+                    assert torch.allclose(mps(data, **case),
+                                          fresh_mps(data, **case))
+        assert len(mps._programs) == 3
+    
+    def test_max_programs(self):
+        net = self.ChainTN(torch.float64)
+        data = torch.randn(5, 3, 3, dtype=torch.float64)
+        assert net.max_programs == 1
+        
+        net.max_programs = 2
+        net(data, True)
+        net(data, False)
+        assert len(net._programs) == 2
+        
+        # Same arguments, normalised: no new program
+        assert net.program(from_left=True) is net.program(True, 1.)
+        assert len(net._programs) == 2
+        
+        # The network is reset when one more program is recorded
+        with pytest.warns(UserWarning,
+                          match='Arguments of contract have changed'):
+            result = net(data, True, 2.)
+        assert len(net._programs) == 1
+        assert torch.allclose(result, 2 * net.dense(data))
+        
+        # As many programs as the network keeps: no reset
+        net.max_programs = 1
+        assert len(net._programs) == 1
+        
+        # More programs than the network keeps: reset
+        net.max_programs = 2
+        net(data, False)
+        net.max_programs = 1
+        assert net._programs == dict()
+        assert net.resultant_nodes == dict()
+        
+        with pytest.raises(TypeError):
+            net.max_programs = 1.5
+        with pytest.raises(TypeError):
+            net.max_programs = True
+        with pytest.raises(ValueError):
+            net.max_programs = 0
+    
+    def test_trace_frees_each_program(self):
+        net = self.ChainTN(torch.float64)
+        net.max_programs = None
+        example = torch.zeros(1, 3, 3, dtype=torch.float64)
+        net.trace(example, True)
+        net.trace(example, False)
+        assert len(net._programs) == 2
+        
+        for from_left in [True, False, True]:
+            data = torch.randn(5, 3, 3, dtype=torch.float64)
+            result = net(data, from_left)
+            assert torch.allclose(result, net.dense(data))
+            
+            # Intermediate tensors of the program are erased
+            program = net.program(from_left)
+            assert program._traced
+            for _, successor, _ in program._steps:
+                if successor.child is not program._outputs[0]:
+                    assert successor.child.tensor is None
+            for node in net.data_nodes.values():
+                assert node.tensor is None
+    
+    def test_traced_program_survives_renames(self):
+        class RenormalizeTN(tk.TensorNetwork):
+
+            def __init__(self):
+                super().__init__(name='renormalize_tn')
+                self.node = tk.randn(shape=(3, 2),
+                                     axes_names=('input', 'right'),
+                                     name='node',
+                                     network=self,
+                                     param_node=True,
+                                     dtype=torch.float64)
+
+            def set_data_nodes(self) -> None:
+                super().set_data_nodes([self.node['input']], num_batch_edges=1)
+
+            def contract(self):
+                data_node = self.node.neighbours('input')
+                return (data_node @ self.node).renormalize()
+        
+        net = RenormalizeTN()
+        net.trace(torch.zeros(1, 1, 3, dtype=torch.float64))
+        assert 'contract_edges' in net.resultant_nodes
+        
+        # Another node named "contract_edges" renames the program's one
+        nodeA = tk.randn(shape=(2, 3), network=net, dtype=torch.float64)
+        nodeB = tk.randn(shape=(3, 2), network=net, dtype=torch.float64)
+        nodeA[1] ^ nodeB[0]
+        _ = nodeA @ nodeB
+        assert 'contract_edges' not in net.resultant_nodes
+        
+        for _ in range(2):
+            data = torch.randn(5, 1, 3, dtype=torch.float64)
+            expected = data[:, 0] @ net.node.tensor
+            assert torch.allclose(net(data), expected / expected.norm())
+    
+    def test_program_of_function(self):
+        net = tk.TensorNetwork()
+        node = tk.randn(shape=(3, 4),
+                        axes_names=('left', 'right'),
+                        name='node',
+                        network=net,
+                        param_node=True,
+                        dtype=torch.float64)
+        vector = tk.randn(shape=(5, 3),
+                          axes_names=('batch', 'left'),
+                          name='input',
+                          network=net,
+                          virtual=True,
+                          dtype=torch.float64)
+        vector['left'] ^ node['left']
+        
+        calls = []
+        def fn():
+            calls.append(None)
+            return (vector @ node).renormalize()
+        
+        program = tk.Program(net, fn)
+        assert program.network is net
+        for batch_size in [5, 2]:
+            tensor = torch.randn(batch_size, 3, dtype=torch.float64)
+            vector.tensor = tensor
+            expected = tensor @ node.tensor
+            assert torch.allclose(program(), expected / expected.norm())
+        assert len(calls) == 1  # Replayed, not run again
+        
+        # Recorded again after a reset
+        net.reset()
+        assert torch.allclose(program(), expected / expected.norm())
+        assert len(calls) == 2
+    
+    def test_program_errors(self):
+        net = tk.TensorNetwork()
+        node = tk.randn(shape=(3,), network=net)
+        
+        with pytest.raises(TypeError):
+            tk.Program(node, lambda: node * 2.)
+        with pytest.raises(TypeError):
+            tk.Program(net, node)
+        
+        with pytest.raises(TypeError):
+            tk.Program(net, lambda: (node * 2.).tensor)()
+        
+        inner = tk.Program(net, lambda: node * 2.)
+        with pytest.raises(ValueError):
+            tk.Program(net, lambda: inner() and node * 3.)()
+    
+    def test_failed_recording_records_again(self):
+        net = tk.TensorNetwork()
+        node = tk.randn(shape=(3,), network=net, dtype=torch.float64)
+        
+        calls = []
+        def fn():
+            double = node * 2.
+            calls.append(None)
+            if len(calls) == 1:
+                raise RuntimeError('first call fails')
+            return double + node
+        
+        program = tk.Program(net, fn)
+        with pytest.raises(RuntimeError):
+            program()
+        for _ in range(2):
+            assert torch.allclose(program(), 3 * node.tensor)
+        assert len(calls) == 2

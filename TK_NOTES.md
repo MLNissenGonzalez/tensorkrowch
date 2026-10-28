@@ -256,3 +256,34 @@ variables) needed around tensorkrowch, items 1 and 2. Variants and measurements 
 - `contract_edges`' successors keep the key `(edges, node1, node2)` without
   `keep`/`rescale`; their hints are now the kernel. `a @ b` costs about +1 µs
   per call in lookup and replay (12.1 → 13.0 µs on small tensors).
+
+## Since: `recorded-programs` (issue #2, 2026-10-28)
+
+Several recorded contractions per network. Guide, design and implementation
+are in `docs/programs.md`.
+
+- `Program`: operations recorded from one call of a function on a network's
+  nodes, replayed in the next calls (`fn_next` with the successors found once,
+  no `check_first`). `forward(data, *args)` is `self.program(*args)(data)`;
+  `net.program(*args)` keeps one program per set of normalised `contract`
+  arguments; `tk.Program(net, fn)` makes one of any function.
+- `max_programs` (default 1: a new set of arguments warns and resets, as
+  before; `None` keeps all until `reset`). Programs are freed only together:
+  evicting one would delete some nodes (name collisions or renames) and the
+  `ParamStackNode` that `auto_stack` shares between programs.
+- Each program has its own successor cache (`node._successor_caches`), so
+  two contractions starting with the same operation on the same nodes no
+  longer share (and lose) a step; and its own `_seq_ops` and inverse memory.
+  The operations reach them through properties of the network, unchanged.
+- Inputs are nodes: a program reads what its nodes hold when called
+  (data nodes via `program(data)`, parameters, any node set with
+  `node.tensor = t`).
+- Fixes on the way: the inverse memory is keyed by the node storing the
+  memory, not its name, so a traced network survives a rename of its nodes
+  (`x` → `x_0` when another `x` appears), which raised `KeyError`; eager
+  operations no longer hit (and count against) the traced program's cache.
+- `MPS.sample` keeps `_sample_kernel`: its steps can be programs, but not in
+  fewer lines, for about 13 of 70 µs per step.
+- Code: +120 lines in `components.py` (without docstrings and comments);
+  timings of `a @ b` and of an MPS forward unchanged within noise.
+

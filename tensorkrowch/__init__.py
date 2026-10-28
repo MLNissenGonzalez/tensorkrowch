@@ -13,7 +13,7 @@ from tensorkrowch.components import Axis
 from tensorkrowch.components import AbstractNode, Node, ParamNode
 from tensorkrowch.components import StackNode, ParamStackNode
 from tensorkrowch.components import Edge, StackEdge
-from tensorkrowch.components import Successor, TensorNetwork
+from tensorkrowch.components import Successor, TensorNetwork, Program
 
 # Initializers
 from tensorkrowch.initializers import empty, zeros, ones, copy, rand, randn

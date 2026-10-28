@@ -5587,7 +5587,7 @@ class TestMergeSplitEdge:  # MARK: TestMergeSplitEdge
         result3 = net()
 
         assert result3.shape == (7, 5)
-        assert net._traced
+        assert net.program()._traced
 
     def test_merge_dangling_edges_in_place(self):
         net = tk.TensorNetwork()
