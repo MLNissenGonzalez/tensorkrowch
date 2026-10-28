@@ -25,7 +25,7 @@ the source or by a probe; guesses are marked as such.
   `_compatible_shape`, `components.py:1305`, lets them differ when a tensor is set).
 - `mul`/`div`/`add`/`sub` by a **tensor or number** key on `(node1,)` alone
   (`_check_first_div`, `operations.py:696`), so dividing by a freshly computed
-  norm tensor still reuses the successor. (develop-unified: `_elementwise_key`;
+  norm tensor still reuses the successor. (main: `_elementwise_key`;
   the replay of these, broken before, now passes the operand again; see below.)
 - Successors survive until `reset`. Reuse needs **the same node objects** as
   operands: a node created anew each call (e.g. a fresh data node per call) makes
@@ -38,7 +38,7 @@ the source or by a probe; guesses are marked as such.
   replays `_seq_ops`** (`self.operations[op](*args)` in order) and returns the last
   result. A replay does not run `contract()`'s Python, so any side effect there
   (bm4tc's log-norm accumulation in an overridden `_inline_contraction`) is skipped.
-  That is why bm4tc used to `reset` around every forward. (develop-unified: such
+  That is why bm4tc used to `reset` around every forward. (main: such
   computations can be `tk.operation`s, and `contract` can return several nodes;
   see below.)
 - Calling **`contract()` directly** instead runs its Python every time while every
@@ -99,7 +99,7 @@ the source or by a probe; guesses are marked as such.
   keep the norms). tk's `renormalize` operation divides by the norm and **discards**
   it. A `renormalize` that returns the log-norm as a node of its own would put the
   accumulation on tk's path (trace, successors, replay), and bm4tc's override and
-  special forward could go (in bm4tc's plan as a deep option). (develop-unified:
+  special forward could go (in bm4tc's plan as a deep option). (main:
   a `tk.operation` does that; `docs/custom_operations.md` §2.3 has the MPS.)
 - 1.1.6 `contract` contracts every site with its data first, (B, r, r) per site,
   and keeps all of them: B·n·r² stored (153 MiB per sample at 784 sites, r160).
@@ -117,7 +117,7 @@ the source or by a probe; guesses are marked as such.
   `test_to_contracted` (MPS, UMPS) and `test_deparameterize_preserves_boundary_runtime`
   fail on develop itself; `test_entropy` and `test_canonicalize_univocal_diff_dims`
   fail at random (unseeded shapes). Doctests need `tk` and `torch` in their globals.
-  (develop-unified: both random failures root-caused and fixed; see below.)
+  (main: both random failures root-caused and fixed; see below.)
 
 ## This branch (`sampling-efficiency`)
 
@@ -170,7 +170,7 @@ and the trace bookkeeping is only reachable through private flags);
   `sample-density` −8e-4 there, up to −4.6% with per-sample windows; float64 clean.
   Not solved; see bm4tc plan.md, "Sampling" step 6.
 
-## Since: `develop-unified` (2026-10-26)
+## Since: `main`, formerly `develop-unified` (2026-10-26)
 
 The branch that unites develop's branches of the month: `zipup-input`,
 `fix-cuda-device-tests`, `sample-density`, `sampling-efficiency` (notes and the tests of
