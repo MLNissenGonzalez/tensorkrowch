@@ -1532,8 +1532,14 @@ class AbstractNode(ABC):  # MARK: AbstractNode
 
     def unset_tensor(self) -> None:
         """
-        Replaces node's tensor with ``None``. This can only be used for **non**
-        ``resultant`` nodes that store their own tensors.
+        Replaces node's tensor with ``None``. This can only be used for nodes
+        that store their own tensors.
+        
+        For ``resultant`` nodes, it frees the memory of an intermediate result
+        once it is not needed anymore, when operations are called without
+        :meth:`~TensorNetwork.trace` (a traced :meth:`~TensorNetwork.forward`
+        frees them itself). The next call of the operation that created the
+        node sets its tensor again.
         
         Examples
         --------
@@ -1546,11 +1552,11 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         True
         """
         # If node stores its own tensor
-        if not self.is_resultant() and (self._tensor_info['address'] is not None):
+        if self._tensor_info['address'] is not None:
             self._save_in_network(None)
         else:
-            raise ValueError('Node\'s tensor can only be changed if it is not'
-                             ' resultant and stores its own tensor')
+            raise ValueError('Node\'s tensor can only be unset if it stores '
+                             'its own tensor')
 
     def set_tensor_from(self, other: 'AbstractNode') -> None:
         """
