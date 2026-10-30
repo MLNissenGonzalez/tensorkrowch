@@ -20,6 +20,7 @@ This script contains tests for components:
     * TestProgram
 """
 
+import copy
 import io
 import warnings
 
@@ -3940,3 +3941,94 @@ class TestProgram:  # MARK: TestProgram
             assert torch.allclose(
                 loaded.log_value(x, other=loaded, observed=(0, 2)), values[1])
 
+    
+    class NormMPS(tk.models.MPS):
+        """An MPS whose contract(norm=True) is Z from copies of its nodes."""
+        
+        def contract(self, norm=False, **kwargs):
+            if not norm:
+                return super().contract(**kwargs)  # stacks its nodes
+            nodes = [self._left_node] + self._mats_env + [self._right_node]
+            ket = [self.copy_node(node) for node in nodes]
+            bra = [self.copy_node(node) for node in nodes]
+            for layer in (ket, bra):
+                for a, b in zip(layer[:-1], layer[1:]):
+                    a['right'] ^ b['left']
+            for k, b in zip(ket[1:-1], bra[1:-1]):
+                k['input'] ^ b['input']
+            env = (ket[0] @ ket[1]) @ (bra[0] @ bra[1])
+            for k, b in zip(ket[2:-1], bra[2:-1]):
+                env = (env @ k) @ b
+            return (env @ ket[-1]) @ bra[-1]
+        
+        def dense(self, x):
+            tensors = [node.tensor for node in self._mats_env]
+            env = self._left_node.tensor.expand(x.shape[0], -1)
+            for i, tensor in enumerate(tensors):
+                env = torch.einsum('za,zi,aib->zb', env, x[:, i], tensor)
+            amplitudes = env @ self._right_node.tensor
+            full = self._left_node.tensor
+            for tensor in tensors:
+                full = torch.einsum('...a,aib->...ib', full, tensor)
+            full = full @ self._right_node.tensor
+            return amplitudes, (full ** 2).sum()
+    
+    @pytest.mark.parametrize('copies_first', [True, False])
+    def test_copy_node_then_stack(self, copies_first):
+        # copy_node references the nodes; stacking them later (auto_stack)
+        # moves their memory into the stack, which the copies follow
+        mps = self.NormMPS(n_sites=4, phys_dim=2, bond_dim=3,
+                           init_method='randn', std=0.5,
+                           dtype=torch.float64)
+        mps.max_programs = None
+        x = torch.rand(5, 4, 2, dtype=torch.float64)
+        
+        calls = [lambda: mps(norm=True), lambda: mps(x)]
+        if not copies_first:
+            calls.reverse()
+        for call in calls:
+            call()  # records both (the first stacks the parameters)
+        for _ in range(3):
+            values = [call() for call in calls]
+            norm, amplitudes = values if copies_first else values[::-1]
+            expected_amplitudes, expected_norm = mps.dense(x)
+            assert torch.allclose(norm, expected_norm)
+            assert torch.allclose(amplitudes, expected_amplitudes)
+            
+            params = list(mps.parameters())
+            loss = norm - amplitudes.sum()
+            expected = expected_norm - expected_amplitudes.sum()
+            grads = torch.autograd.grad(loss, params)
+            for grad, expected_grad in zip(
+                    grads, torch.autograd.grad(expected, params)):
+                assert torch.allclose(grad, expected_grad)
+            
+            with torch.no_grad():
+                for param in params:
+                    param.add_(0.1 * torch.randn_like(param))
+    
+    @pytest.mark.parametrize('restore', ['pickle', 'deepcopy'])
+    def test_restored_network_resets(self, restore):
+        # Recorded again from a reset network: no old stack next to the new
+        mps = tk.models.MPS(n_sites=4, phys_dim=2, bond_dim=2,
+                            dtype=torch.float64)
+        x = torch.rand(3, 4, 2, dtype=torch.float64)
+        with torch.no_grad():  # deepcopy needs leaf tensors only
+            expected = mps(x)
+        keys = sorted(mps.state_dict())
+        n_resultant = len(mps.resultant_nodes)
+        
+        if restore == 'pickle':
+            buffer = io.BytesIO()
+            torch.save(mps, buffer)
+            buffer.seek(0)
+            restored = torch.load(buffer, weights_only=False)
+        else:
+            restored = copy.deepcopy(mps)
+        assert restored.resultant_nodes == dict()
+        
+        assert torch.allclose(restored(x), expected)
+        assert sorted(restored.state_dict()) == keys
+        assert len(restored.resultant_nodes) == n_resultant
+        assert len(list(restored.parameters())) == \
+            len(list(mps.parameters()))

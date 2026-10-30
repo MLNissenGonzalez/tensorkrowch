@@ -598,10 +598,15 @@ class AbstractNode(ABC):  # MARK: AbstractNode
             result = self._temp_tensor
             return result
         
-        address = self.tensor_address()
         index = self._tensor_info['index']
-        
-        result = self._network._memory_nodes[address]
+        node_ref = self._tensor_info['node_ref']
+        if (self._tensor_info['address'] is None) and \
+                (node_ref._tensor_info['address'] is None):
+            # The referenced node's memory moved after this node referenced
+            # it (e.g. into a stack, with ``auto_stack``): follow it
+            result = node_ref.tensor
+        else:
+            result = self._network._memory_nodes[self.tensor_address()]
 
         return_result = (index is None) or (result is None)
         if not self._network._auto_unbind:
@@ -1399,9 +1404,16 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         access to the tensor is used from ``Operations``, so ``self`` should
         (and will) be a non-empty node.
         """
+        address = node_ref._tensor_info['address']
+        if address is None:
+            # ``node_ref``'s memory moved after the operation was recorded
+            # (e.g. into a stack, with ``auto_stack``): follow it
+            tensor = node_ref.tensor
+        else:
+            tensor = self._network._memory_nodes[address]
         if index is None:
-            return self._network._memory_nodes[node_ref._tensor_info['address']]
-        return self._network._memory_nodes[node_ref._tensor_info['address']][index]
+            return tensor
+        return tensor[index]
 
     def _direct_set_tensor(self, tensor: Optional[Tensor]) -> None:
         """Sets a new node's tensor without checking extra conditions."""
@@ -1636,8 +1648,8 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         """Returns address of the node's tensor in the network's memory."""
         address = self._tensor_info['address']
         if address is None:
-            node_ref = self._tensor_info['node_ref']
-            address = node_ref._tensor_info['address']
+            # Through the referenced node, whose memory may also have moved
+            address = self._tensor_info['node_ref'].tensor_address()
         return address
     
     def node_ref(self) -> 'AbstractNode':
@@ -5460,6 +5472,13 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                     f'name {key}')
         else:
             raise TypeError('`key` should be int or str type')
+
+    def __setstate__(self, state: Dict[Text, Any]) -> None:
+        # Unpickled (or deep-copied) without its recordings (see
+        # ``Program.__getstate__``): reset, so that their nodes and stacked
+        # parameters do not stay next to the new recordings
+        super().__setstate__(state)
+        self.reset()
 
     def __str__(self) -> Text:
         return self.name
