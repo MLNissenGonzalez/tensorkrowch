@@ -5474,9 +5474,11 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
             raise TypeError('`key` should be int or str type')
 
     def __setstate__(self, state: Dict[Text, Any]) -> None:
-        # Unpickled (or deep-copied) without its recordings (see
-        # ``Program.__getstate__``): reset, so that their nodes and stacked
-        # parameters do not stay next to the new recordings
+        # Unpickled (or deep-copied) without its recordings and the nodes'
+        # successors (see ``Program.__getstate__`` and
+        # ``AbstractNode.__getstate__``): reset, so that the contraction is
+        # recorded again, without the old nodes and stacked parameters next
+        # to the new ones
         super().__setstate__(state)
         self.reset()
 
