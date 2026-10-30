@@ -19,6 +19,9 @@ This script contains tests for components:
     * TestTensorNetwork
 """
 
+import copy
+import io
+
 import pytest
 
 import torch
@@ -3467,6 +3470,33 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
         net.reset()
         assert net._contract_outputs is None
         assert net.resultant_nodes == dict()
+
+    @pytest.mark.parametrize('restore', ['pickle', 'deepcopy'])
+    def test_restored_network_after_forward(self, restore):
+        # Successors are not pickled (kernels can be local functions): the
+        # restored network is reset and records its contraction again
+        mps = tk.models.MPS(n_sites=4, phys_dim=2, bond_dim=2,
+                            dtype=torch.float64)
+        x = torch.rand(3, 4, 2, dtype=torch.float64)
+        with torch.no_grad():  # deepcopy needs leaf tensors only
+            mps(x)
+            expected = mps(x)
+        keys = sorted(mps.state_dict())
+        n_resultant = len(mps.resultant_nodes)
+        
+        if restore == 'pickle':
+            buffer = io.BytesIO()
+            torch.save(mps, buffer)
+            buffer.seek(0)
+            restored = torch.load(buffer, weights_only=False)
+        else:
+            restored = copy.deepcopy(mps)
+        assert restored.resultant_nodes == dict()
+        
+        for _ in range(2):
+            assert torch.allclose(restored(x), expected)
+        assert sorted(restored.state_dict()) == keys
+        assert len(restored.resultant_nodes) == n_resultant
 
     def test_forward_several_outputs_error(self):
         class WrongOutputsTN(tk.TensorNetwork):
