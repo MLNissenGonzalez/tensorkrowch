@@ -339,7 +339,10 @@ def _build_operation(name: Text,
                                                     successor.index)]
         if runtime:
             tensors += _runtime_values(args, runtime)
-        tensors = successor.hints['kernel'](*tensors)
+        kernel = successor.hints.get('kernel')
+        if kernel is None:  # unpickled (or deep-copied): plan it again
+            kernel = successor.hints['kernel'] = fn(*args)[0]
+        tensors = kernel(*tensors)
         
         child = successor.child
         if successor.hints['single']:
@@ -3664,9 +3667,10 @@ def _contract_edges_plan(edges: Optional[Tuple[Edge, ...]],
                           and node2.get_axis(axis._name)._batch)
                       or (axis._name in keep)]
     
-    if not shared_edges and not kept_names:
+    if not shared_edges and not kept_names and not rescale:
         raise ValueError(f'No batch edges, kept edges or shared edges between '
-                         f'nodes {node1!s} and {node2!s} found')
+                         f'nodes {node1!s} and {node2!s} found (an outer '
+                         f'product is computed with `rescale=True`, or tprod)')
     
     if node1 is node2:
         # Trace: each contracted edge is a diagonal, summed
@@ -4096,6 +4100,9 @@ def contract_between(node1: AbstractNode,
     that only share batch or kept axes are contracted as an outer product in
     the rest of axes. With ``rescale = True``, the result is divided by its
     largest absolute value per sample, whose logarithm is also returned.
+    Nodes that share nothing raise an error, unless ``rescale = True``: a
+    rescaled contraction is a step of a contraction path, where an outer
+    product is a valid step (for an unscaled one, see :func:`tprod`).
     
     Nodes ``resultant`` from this operation are called ``"contract_edges"``.
     The node that keeps information about the :class:`Successor` is ``node1``.
@@ -4178,6 +4185,9 @@ contract_between_node.__doc__ = \
     that only share batch or kept axes are contracted as an outer product in
     the rest of axes. With ``rescale = True``, the result is divided by its
     largest absolute value per sample, whose logarithm is also returned.
+    Nodes that share nothing raise an error, unless ``rescale = True``: a
+    rescaled contraction is a step of a contraction path, where an outer
+    product is a valid step (for an unscaled one, see :func:`tprod`).
     
     Nodes ``resultant`` from this operation are called ``"contract_edges"``.
     The node that keeps information about the :class:`Successor` is ``self``.
@@ -6784,6 +6794,12 @@ def operation(fn: Optional[Callable] = None,
     Arguments other than nodes are recorded in the first call, and the same
     objects are used in the next calls. Thus, they should be hashable (lists
     are turned into tuples).
+    
+    ``fn`` can also run again on the same nodes: a network that is pickled or
+    deep-copied keeps its resultant nodes but not their kernels (local
+    functions cannot be pickled), and each operation calls ``fn`` again, in
+    its next call, to get its kernel. So ``fn`` should only plan: compute and
+    return ``(kernel, axes)``, without other effects.
     
     The operation is registered with ``name`` in
     :attr:`TensorNetwork.operations`, and its resultant nodes take that name.

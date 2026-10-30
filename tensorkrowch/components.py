@@ -696,13 +696,6 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         """
         return self._successors
 
-    def __getstate__(self) -> Dict[Text, Any]:
-        # Pickled (or deep-copied) without the operations' cached results,
-        # whose kernels can be local functions (see TensorNetwork.__setstate__)
-        state = self.__dict__.copy()
-        state['_successors'] = dict()
-        return state
-
     @property
     def name(self) -> Text:
         """
@@ -3924,6 +3917,15 @@ class Successor:  # MARK: Successor
         self.child = child
         self.hints = hints
 
+    def __getstate__(self) -> Dict[Text, Any]:
+        # Pickled (or deep-copied) without the kernel, a local function that
+        # cannot be pickled; the operation plans it again in its next call
+        state = self.__dict__.copy()
+        if isinstance(self.hints, dict) and ('kernel' in self.hints):
+            state['hints'] = {key: value for key, value in self.hints.items()
+                              if key != 'kernel'}
+        return state
+
 
 ###############################################################################
 #                                TENSOR NETWORK                               #
@@ -5209,13 +5211,6 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                     f'name {key}')
         else:
             raise TypeError('`key` should be int or str type')
-
-    def __setstate__(self, state: Dict[Text, Any]) -> None:
-        # Nodes are unpickled (or deep-copied) without their successors (see
-        # ``AbstractNode.__getstate__``): reset, so that the contraction is
-        # recorded again instead of replayed without them
-        super().__setstate__(state)
-        self.reset()
 
     def __str__(self) -> Text:
         return self.name
