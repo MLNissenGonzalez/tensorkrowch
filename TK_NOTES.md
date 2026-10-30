@@ -291,3 +291,10 @@ are in `docs/programs.md`.
   call (the resultant node detached the parameter that `conj` returned).
 - `MPS.sample` keeps `_sample_kernel`: its steps can be programs, but not in
   fewer lines, for about 13 of 70 µs per step.
+- After the review of #4: `copy_node(node)` (a program's copy sharing a
+  node's tensor, new edges, deleted by `reset`) replaces hand-made
+  `virtual_result_*` copies; a program with input nodes called without data
+  raises; pickling drops successors and recordings (`torch.save` failed on
+  local kernels, on `contraction-primitives` too); the internal flags are
+  `_recording` and `_freeing` (were `_tracing`, `_traced`). The notes above
+  that name `_tracing`/`_traced` describe the code before this branch.

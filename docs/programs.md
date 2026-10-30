@@ -58,14 +58,8 @@ class BornChain(tk.TensorNetwork):
         # Z = <psi|psi>: a ket and a bra copy of each core, sharing its
         # memory (one edge per axis: the cores' input edges are taken by
         # their data nodes)
-        ket, bra = [], []
-        for c in self.cores:
-            for layer in (ket, bra):
-                copy = tk.ParamNode(shape=c.shape, axes_names=c.axes_names,
-                                    name='virtual_result_copy',
-                                    network=self, virtual=True)
-                copy.set_tensor_from(c)
-                layer.append(copy)
+        ket = [self.copy_node(c) for c in self.cores]
+        bra = [self.copy_node(c) for c in self.cores]
         for layer in (ket, bra):
             for a, b in zip(layer[:-1], layer[1:]):
                 a['right'] ^ b['left']
@@ -98,8 +92,9 @@ for step in range(100):
 print(f'{loss.item():.3f}', len(net._programs))
 ```
 
-Output: `9.025 2` (the loss after 100 steps; two programs). The loss and
-its gradients equal those of a dense contraction.
+Output: a loss of about 9.0 after 100 steps, and 2 programs (the last
+digits vary across machines). The loss and its gradients equal those of a
+dense contraction.
 
 What happens in the loop:
 
@@ -176,8 +171,9 @@ ways:
   `contract`): each program has its own, created while it is recorded, so
   each contraction can read different variables (§1.5).
 
-The parameters are read through any node that shares their memory (the
-copies made with `set_tensor_from`).
+The parameters are read through any node that shares their memory:
+`self.copy_node(node)`, called inside `contract`, makes a copy of a node
+that shares its tensor, with new edges, for this program (deleted with it).
 
 ### 1.5 Different observed variables per contraction: input nodes
 
@@ -227,8 +223,9 @@ y = program()           # records the first time, replays afterwards
 | `max_programs < 1` | `ValueError` |
 | `free_intermediates` not a bool | `TypeError` |
 | arguments of `contract` not hashable | `TypeError` |
-| `input_node` outside a recording, or in a network with data nodes | `ValueError` |
-| `data` not a list with one tensor per input node | `ValueError` |
+| `input_node` or `copy_node` outside a recording; `input_node` in a network with data nodes; `copy_node` of a node of another network | `ValueError` |
+| `copy_node` of something other than a `Node` or `ParamNode` | `TypeError` |
+| `data` not a list with one tensor per input node, or missing for a program with input nodes | `ValueError` |
 | `data` for a program without input nodes, in a network without data nodes | `TypeError` |
 | `Program(net, fn)` with `net` not a `TensorNetwork` or `fn` not callable | `TypeError` |
 | `fn` (or `contract`) returns something other than a node or a tuple of nodes | `TypeError` |
@@ -322,7 +319,10 @@ Before, "the recording" was a set of fields of the network
 six of which (`split`, `merge_edges`, `split_edge`, `stack`, `unbind`,
 `einsum`) do it in their own code. Those names now resolve to the fields of
 the program being called (`net._program`): the network sets it for the
-duration of a call. So no operation changed. Rejected: passing the program
+duration of a call. So no operation changed beyond two renames that say
+what the flags mean now: `_tracing` is `_recording` (the program is being
+recorded and counts reads) and `_traced` is `_freeing` (the program erases
+tensors after their last read). Rejected: passing the program
 to every operation (an argument threaded through every signature), and
 rewriting the six operations on the shared core first (larger, and not
 needed for this).
@@ -434,10 +434,11 @@ contraction method that returns several outputs from one program.
 |---|---|
 | `Program` | end of the module: `_clear`, `__call__` (where the data goes; record, fill inputs, replay), `_fill_inputs`, `_record` (runs `fn`, checks outputs, marks them not erasable, resolves the steps), `_eager_state` |
 | network state | `TensorNetwork.__init__`: `_eager`, `_program`, `_programs` (key → Program), `_max_programs`, `_free_intermediates`, `_generation` |
-| properties to the program being called | `_seq_ops`, `_inverse_memory`, `_tracing` (= the program is recording), `_traced` (= `free_intermediates`, not while recording) |
+| properties to the program being called | `_seq_ops`, `_inverse_memory`, `_recording`, `_freeing` (= `free_intermediates`, not while recording) |
 | `max_programs`, `free_intermediates`, `_full` | after `resultant_nodes` |
 | `_program_for`, `_contract_key`, `_hashable_arg` | after `trace`; `_hashable_arg` is a module function |
-| `input_node`, `_takes_data_nodes` | before `_add_data_or_set_nodes` |
+| `input_node`, `copy_node`, `_recording_program`, `_takes_data_nodes` | before `_add_data_or_set_nodes` |
+| pickling (`torch.save`) and deep copies | `AbstractNode.__getstate__` drops the cached successors (their kernels are local functions), `Program.__getstate__` drops the recording: programs record again after loading |
 | `forward`, `trace`, `reset` | `forward` = `self._program_for(*args, **kwargs)(data)`; `trace` resets if full, calls the network, sets `free_intermediates`; `reset` empties `_programs`, increases `_generation`, clears `_eager` and every node's `_successor_caches` |
 | successors | `AbstractNode._successors` (property): `_successor_caches[network._program]` |
 | inverse memory | `_record_in_inverse_memory`, `_check_inverse_memory`: keyed by `node.node_ref()`; `_update_node_info` no longer moves keys |
@@ -484,6 +485,13 @@ and neither record nor check the inverse memory.
   resultant node detached it, so its first call had no gradient.
 - Two tests read the removed private attributes `_contract_outputs` and
   `net._traced`; they read `net._programs` and `net.free_intermediates`.
+  Three tests set `net._tracing` and `net._traced` around eager operations
+  to check freeing; they are one test, parametrised, through a `Program`
+  with `free_intermediates` (end state and values).
+- A network pickled after `forward` is saved without its recordings and
+  records them again after loading (`torch.save` failed on the local
+  kernel functions; on #3's branch too). The old program's resultant nodes
+  stay until the next `reset`.
 
 ### 4.4 Tests
 
@@ -503,7 +511,9 @@ and neither record nor check the inverse memory.
 - §5's `Chain`, three programs with input nodes (Z, the likelihood, a
   marginal), float64 and complex128, freeing on and off: the mixed loss and
   its gradients equal a dense contraction;
-- input-node errors; `Program(net, fn)`: replays without calling `fn`, with
+- `copy_node`: shares the tensor and the gradient, new dangling edges,
+  deleted by `reset`, errors; `torch.save`/`torch.load` after a forward;
+- input-node errors (also a call without data); `Program(net, fn)`: replays without calling `fn`, with
   inputs set by `node.tensor = t` and another batch size, records again
   after `reset`; errors; a failed recording is recorded again.
 
@@ -564,15 +574,9 @@ class Chain(tk.TensorNetwork):
         for a, b in zip(self.cores[:-1], self.cores[1:]):
             a['right'] ^ b['left']
 
-    def _layer(self, name):
+    def _layer(self):
         """Copies of the cores sharing their memory, wired along the chain."""
-        copies = []
-        for core in self.cores:
-            copy = tk.ParamNode(shape=core.shape, axes_names=core.axes_names,
-                                name='virtual_result_' + name,
-                                network=self, virtual=True)
-            copy.set_tensor_from(core)
-            copies.append(copy)
+        copies = [self.copy_node(core) for core in self.cores]
         for a, b in zip(copies[:-1], copies[1:]):
             a['right'] ^ b['left']
         return copies
@@ -580,7 +584,7 @@ class Chain(tk.TensorNetwork):
     def contract(self, other=None, observed=()):
         if other is not self:
             raise ValueError('this example has only other=self')
-        ket, bra = self._layer('ket'), self._layer('bra')
+        ket, bra = self._layer(), self._layer()
         logs = []
         env = None
         for i, (k, b) in enumerate(zip(ket, bra)):
@@ -635,16 +639,17 @@ for step in range(100):
 print(f'{loss.item():.3f}', len(net._programs))
 ```
 
-Output: `14.115 3` (the loss after 100 steps, from 21.09 at the first;
-three programs). The values and gradients equal a dense contraction, in
+Output: a loss of about 14.1 after 100 steps (from about 21.1 at the
+first), and 3 programs (the last digits vary across machines). The values and gradients equal a dense contraction, in
 float64 and complex128 (`tests/test_components.py::TestProgram`, which has
 this `Chain`).
 
 What each piece does:
 
 - `_layer` makes copies of the cores that share their memory
-  (`set_tensor_from`): each pattern wires its own copies, since a leg can
-  be connected to one other leg only.
+  (`copy_node`): each pattern wires its own copies, since a leg can be
+  connected to one other leg only. The copies belong to the program and are
+  deleted with it.
 - `contract` zips the two layers from the left. At site `i`, the ket copy,
   then (if observed) the input $\varphi\varphi^\dagger$, then the
   conjugated bra copy are absorbed into the environment; the last step is
@@ -656,9 +661,16 @@ What each piece does:
   without batch); the two others have one input per observed variable.
 
 Variants that fit the same scheme: `open` variables (leave their legs
-dangling, and return them as outputs: a marginal over them); `other` a
-different network (needs its cores in the same tensorkrowch network, or
-copies of them, since nodes of two networks cannot be connected); a
-dictionary for `observed` (turn it into a tuple of variables for the key
-and a list of values for the data in `forward`); conditionals
+dangling, and return them as outputs: a marginal over them); a dictionary
+for `observed` (turn it into a tuple of variables for the key and a list
+of values for the data in `forward`); conditionals
 $p(x_I \mid x_J) = P(x_{I\cup J})/P(x_J)$, two programs.
+
+`other` a different network: its nodes cannot be connected to this
+network's (`copy_node` and `set_tensor_from` work within one network), and
+a copy of its tensors goes stale after an optimizer step. What works is
+passing `other`'s tensors as inputs: `contract` creates one input node per
+core of `other` (`input_node`, the bra layer), and `forward` passes
+`[core.tensor for core in other.cores]` in `data`, with the observed
+values. The review of #4 checked values and gradients (also with respect to
+`other`'s parameters) against a dense contraction this way.

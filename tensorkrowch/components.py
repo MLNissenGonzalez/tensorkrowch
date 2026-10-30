@@ -715,6 +715,13 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         program = None if self._network is None else self._network._program
         self._successor_caches[program] = successors
 
+    def __getstate__(self) -> Dict[Text, Any]:
+        # Pickled (or deep-copied) without the operations' cached results,
+        # whose kernels can be local functions; programs record again
+        state = self.__dict__.copy()
+        state['_successor_caches'] = dict()
+        return state
+
     @property
     def name(self) -> Text:
         """
@@ -1695,7 +1702,7 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         """
         net = self._network
 
-        # When contracting network, if it is traced, we keep track of the number
+        # When replaying a program that frees tensors, we keep track of the number
         # of accesses to "erasable" nodes
         aux_dict = net._inverse_memory[node_ref]
         aux_dict['re-accessed'] += 1
@@ -1711,8 +1718,7 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         keeps track of:
 
         * The total amount of times that the node's tensor is accessed to compute
-          operations (calculated when contracting the network for the first time,
-          in ``tracing`` mode).
+          operations (counted while a :class:`Program` is recorded).
 
         * The number of accesses to the node's tensor in the current contraction.
 
@@ -4261,35 +4267,20 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
     def _inverse_memory(self) -> Dict['AbstractNode', Dict[Text, Any]]:
         return self._program._inverse_memory
 
-    @_inverse_memory.setter
-    def _inverse_memory(self,
-                        inverse_memory: Dict['AbstractNode',
-                                             Dict[Text, Any]]) -> None:
-        self._program._inverse_memory = inverse_memory
-
     @property
-    def _tracing(self) -> bool:
-        """Whether a program is being recorded (operations record their
-        operands in the program's inverse memory)."""
+    def _recording(self) -> bool:
+        """Whether a program is being recorded (operations count the reads of
+        their operands in the program's inverse memory)."""
         return self._program._recording
 
-    @_tracing.setter
-    def _tracing(self, tracing: bool) -> None:
-        self._program._recording = tracing
-
     @property
-    def _traced(self) -> bool:
-        """Whether the program being called frees its intermediate tensors
-        (not while it is recorded, when its reads are being counted)."""
+    def _freeing(self) -> bool:
+        """Whether the program being called erases each tensor after its last
+        read (:attr:`free_intermediates`; not while it is recorded, when its
+        reads are being counted)."""
         program = self._program
-        if program._traced:
-            return True
         return self._free_intermediates and (program is not self._eager) \
             and not program._recording
-
-    @_traced.setter
-    def _traced(self, traced: bool) -> None:
-        self._program._traced = traced
 
     @property
     def edges(self) -> List[Edge]:
@@ -5278,11 +5269,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
             If no program is being recorded, or the network has ``data``
             nodes.
         """
-        program = self._program
-        if (program is self._eager) or not program._recording:
-            raise ValueError('Input nodes can only be created while a '
-                             'program is being recorded (in `contract`, or '
-                             'the function of a Program)')
+        program = self._recording_program('Input nodes')
         if self._data_nodes:
             raise ValueError('The network has data nodes, which take its '
                              'data; it cannot also take data in input nodes')
@@ -5300,6 +5287,67 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                     device=device)
         program._inputs.append(node)
         return node
+
+    def copy_node(self, node: AbstractNode) -> AbstractNode:
+        """
+        Creates a copy of ``node`` for the :class:`Program` being recorded:
+        a node with the shape and axes names of ``node``, sharing its tensor
+        (a :class:`ParamNode` if ``node`` is one, so gradients reach the
+        parameter), and with new, dangling edges, which the program connects
+        in its own way. Called inside :meth:`contract` (or the function of a
+        :class:`Program`), e.g. for the ket and bra layers of a contraction
+        of the network with itself, or for the copies of one pattern.
+        
+        It is deleted with the program, by :meth:`reset`.
+
+        Parameters
+        ----------
+        node : Node or ParamNode
+            Node of the network whose tensor the copy shares.
+
+        Returns
+        -------
+        Node or ParamNode
+        
+        Raises
+        ------
+        ValueError
+            If no program is being recorded, or ``node`` is not a node of
+            the network.
+        TypeError
+            If ``node`` is not a :class:`Node` or :class:`ParamNode` (e.g. a
+            stack node).
+        
+        Examples
+        --------
+        In a contraction of the network with itself:
+        
+        >>> def contract(self):
+        ...     ket = [self.copy_node(node) for node in self.cores]
+        ...     bra = [self.copy_node(node) for node in self.cores]
+        ...     ...
+        """
+        self._recording_program('Copies of nodes')
+        if (type(node) is not Node) and (type(node) is not ParamNode):
+            raise TypeError('`node` should be Node or ParamNode type')
+        if node._network is not self:
+            raise ValueError('`node` should be a node of the network')
+        copy = type(node)(shape=node._shape,
+                          axes_names=node.axes_names,
+                          name='virtual_result_copy',
+                          network=self,
+                          virtual=True)
+        copy.set_tensor_from(node)
+        return copy
+
+    def _recording_program(self, what: Text) -> 'Program':
+        """The program being recorded; raises if there is none."""
+        program = self._program
+        if (program is self._eager) or not program._recording:
+            raise ValueError(f'{what} can only be created while a program '
+                             'is being recorded (in `contract`, or the '
+                             'function of a Program)')
+        return program
 
     def _takes_data_nodes(self) -> bool:
         """Whether the network takes its data in data nodes (it has some, or
@@ -5516,13 +5564,20 @@ class Program:  # MARK: Program
         self._inputs = []           # input nodes, created while recording
         self._inverse_memory = dict()
         self._recording = False
-        self._traced = False        # (only set for the eager state)
         self._generation = None     # network's generation when recorded
 
     @property
     def network(self) -> TensorNetwork:
         """Network whose nodes the program contracts."""
         return self._network
+
+    def __getstate__(self) -> Dict[Text, Any]:
+        # Pickled (or deep-copied) without its recording, whose kernels are
+        # local functions: it is recorded again in its next call
+        state = self.__dict__.copy()
+        state.update(_seq_ops=[], _steps=None, _inverse_memory=dict(),
+                     _generation=None)
+        return state
 
     def __call__(self,
                  data: Optional[Union[Tensor, Sequence[Tensor]]] = None
@@ -5549,7 +5604,8 @@ class Program:  # MARK: Program
         ValueError
             If it is called while another program of the network is being
             recorded (its operations would not be part of the recording), or
-            ``data`` does not have one tensor per input node.
+            ``data`` does not have one tensor per input node (or is missing,
+            if the program has input nodes).
         TypeError
             If ``data`` is given to a program that has no input nodes, in a
             network without data nodes.
@@ -5572,6 +5628,11 @@ class Program:  # MARK: Program
                 self._record()
             if inputs is not None:
                 self._fill_inputs(inputs)
+            elif self._inputs:
+                raise ValueError(
+                    'The program has input nodes, so it needs `data` in every '
+                    'call (one tensor per input node); without it, it would '
+                    'contract the previous call\'s data, or the placeholders')
             if recorded or (inputs is not None):
                 for fn_next, successor, args in self._steps:
                     fn_next(successor, *args)
