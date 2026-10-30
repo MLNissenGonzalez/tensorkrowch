@@ -298,3 +298,9 @@ are in `docs/programs.md`.
   local kernels, on `contraction-primitives` too); the internal flags are
   `_recording` and `_freeing` (were `_tracing`, `_traced`). The notes above
   that name `_tracing`/`_traced` describe the code before this branch.
+- Second round: references (`set_tensor_from`, `copy_node`) follow a node
+  whose memory moves into a stack later (it raised `KeyError` in replays, and
+  `tensor_address()` was `None`); restored networks reset themselves; a new
+  tensor argument where a program had another raises `ValueError`; `_freeing`
+  is a plain attribute set around replays (eager `a @ b` +0.3 µs over
+  `contraction-primitives`).

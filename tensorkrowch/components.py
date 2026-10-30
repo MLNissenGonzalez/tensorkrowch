@@ -709,11 +709,13 @@ class AbstractNode(ABC):  # MARK: AbstractNode
     @property
     def _successors(self) -> Dict[Text, Dict[Any, 'Successor']]:
         """Successors in the program of the network that is being called."""
-        program = None if self._network is None else self._network._program
-        successors = self._successor_caches.get(program)
-        if successors is None:
+        network = self._network
+        program = None if network is None else network._program
+        try:
+            return self._successor_caches[program]
+        except KeyError:
             successors = self._successor_caches[program] = dict()
-        return successors
+            return successors
 
     @_successors.setter
     def _successors(self, successors: Dict[Text, Dict[Any, 'Successor']]):
@@ -4136,6 +4138,8 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         self._programs = dict()  # contract arguments -> Program
         self._max_programs = 1
         self._free_intermediates = False
+        self._freeing = False  # whether the program being replayed erases
+                               # tensors after their last read (Program)
         self._generation = 0     # increased by reset, which deletes programs
 
     # ----------
@@ -4284,15 +4288,6 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         """Whether a program is being recorded (operations count the reads of
         their operands in the program's inverse memory)."""
         return self._program._recording
-
-    @property
-    def _freeing(self) -> bool:
-        """Whether the program being called erases each tensor after its last
-        read (:attr:`free_intermediates`; not while it is recorded, when its
-        reads are being counted)."""
-        program = self._program
-        return self._free_intermediates and (program is not self._eager) \
-            and not program._recording
 
     @property
     def edges(self) -> List[Edge]:
@@ -5223,6 +5218,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         key = self._contract_key(*args, **kwargs)
         program = self._programs.get(key)
         if program is None:
+            self._check_tensor_arguments(key)
             if self._full():
                 warnings.warn(
                     'Arguments of contract have changed, and the network '
@@ -5367,6 +5363,27 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         return bool(self._data_nodes) or \
             (type(self).set_data_nodes is not TensorNetwork.set_data_nodes)
 
+    def _check_tensor_arguments(self, key: Tuple) -> None:
+        """Raises if ``key`` (of a new program) differs from the key of an
+        existing program only in which tensors it holds: tensors are told
+        apart by object, so a new tensor in every call would record a new
+        program in every call."""
+        masked = _mask_tensors(key)
+        if masked == _tensor_ids(key):  # no tensors
+            return
+        for other in self._programs:
+            if _mask_tensors(other) == masked:
+                names = [name for (name, value), (_, other_value)
+                         in zip(key, other)
+                         if _tensor_ids(value) != _tensor_ids(other_value)]
+                raise ValueError(
+                    f'Arguments {names} of `contract` are tensors other than '
+                    'those of a program the network has: programs are told '
+                    'apart by their arguments, and tensors by object. Values '
+                    'that change between calls go through `data` (data nodes '
+                    'or input nodes); to contract with other constant '
+                    'tensors, reset the network first')
+
     def _add_data_or_set_nodes(self,
                                data: Union[Tensor, Sequence[Tensor]]) -> None:
         """Adds ``data`` to the data nodes, setting them if there are none."""
@@ -5490,6 +5507,32 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                f'\tname: {self.name}\n' \
                f'\tnodes: \n{tab_string(print_list(list(self.nodes.keys())), 2)}\n' \
                f'\tedges:\n{tab_string(print_list(self._edges), 2)})'
+
+
+_TENSOR = object()  # placeholder of tensors in masked arguments
+
+
+def _mask_tensors(arg: Any) -> Any:
+    """``arg`` (from :func:`_hashable_arg`) with each tensor replaced by the
+    same placeholder."""
+    if isinstance(arg, Tensor):
+        return _TENSOR
+    if isinstance(arg, tuple):
+        return tuple(map(_mask_tensors, arg))
+    if isinstance(arg, frozenset):
+        return frozenset(map(_mask_tensors, arg))
+    return arg
+
+
+def _tensor_ids(arg: Any) -> Any:
+    """``arg`` with each tensor replaced by its id, to compare by object."""
+    if isinstance(arg, Tensor):
+        return (Tensor, id(arg))
+    if isinstance(arg, tuple):
+        return tuple(map(_tensor_ids, arg))
+    if isinstance(arg, frozenset):
+        return frozenset(map(_tensor_ids, arg))
+    return arg
 
 
 def _hashable_arg(arg: Any) -> Any:
@@ -5655,10 +5698,12 @@ class Program:  # MARK: Program
                     'call (one tensor per input node); without it, it would '
                     'contract the previous call\'s data, or the placeholders')
             if recorded or (inputs is not None):
+                net._freeing = net._free_intermediates
                 for fn_next, successor, args in self._steps:
                     fn_next(successor, *args)
         finally:
             net._program = net._eager
+            net._freeing = False
         
         if self._single:
             return self._outputs[0].tensor

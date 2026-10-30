@@ -115,7 +115,10 @@ wiring) does not run again.
    `net(data, ...)`. Arguments are compared after normalisation
    (`net(norm=True)` and `net(None, True)` are the same program); they must
    be hashable (lists, tuples, dicts and sets of hashable objects are turned
-   into tuples).
+   into tuples). A tensor among them is told apart by object: passing the
+   same tensor every call is one program, and a different tensor where an
+   existing program had one raises a `ValueError`, since values that change
+   between calls belong in `data`.
 2. **Set `max_programs`** to at least the number of argument sets the loss
    uses (`None`: no limit). With the default, 1, every switch between
    `net(x)` and `net(norm=True)` warns, resets the network and records
@@ -123,7 +126,10 @@ wiring) does not run again.
 3. **Create the optimizer after the first step** if the network stacks its
    parameters (`auto_stack`, as tk's models do): the first recording
    replaces the parameters of stacked nodes by the stack's. (The examples
-   do not stack, so they create the optimizer first.)
+   do not stack, so they create the optimizer first.) With several programs
+   that is the first step that has recorded all of them: a program recorded
+   before the stacking computes its first call on the parameters before
+   they were stacked; from its next call it reads them in the stack.
 4. **Choose the contraction order well**: the order `contract` uses is what
    is replayed. The zip-up order above keeps (r, r) environments;
    contracting all transfer matrices first would build `n` tensors of r⁴
@@ -174,6 +180,10 @@ ways:
 The parameters are read through any node that shares their memory:
 `self.copy_node(node)`, called inside `contract`, makes a copy of a node
 that shares its tensor, with new edges, for this program (deleted with it).
+A constant input (a summed vector $\sum_x \varphi(x)$, a Gram matrix) is a
+plain `tk.Node` of the network made once in `__init__`, and `copy_node` of
+it in each `contract` that uses it: no reserved name, nothing passed per
+call.
 
 ### 1.5 Different observed variables per contraction: input nodes
 
@@ -223,6 +233,7 @@ y = program()           # records the first time, replays afterwards
 | `max_programs < 1` | `ValueError` |
 | `free_intermediates` not a bool | `TypeError` |
 | arguments of `contract` not hashable | `TypeError` |
+| a tensor among the arguments of `contract` where a program has another tensor (and the same other arguments) | `ValueError` |
 | `input_node` or `copy_node` outside a recording; `input_node` in a network with data nodes; `copy_node` of a node of another network | `ValueError` |
 | `copy_node` of something other than a `Node` or `ParamNode` | `TypeError` |
 | `data` not a list with one tensor per input node, or missing for a program with input nodes | `ValueError` |
@@ -434,11 +445,13 @@ contraction method that returns several outputs from one program.
 |---|---|
 | `Program` | end of the module: `_clear`, `__call__` (where the data goes; record, fill inputs, replay), `_fill_inputs`, `_record` (runs `fn`, checks outputs, marks them not erasable, resolves the steps), `_eager_state` |
 | network state | `TensorNetwork.__init__`: `_eager`, `_program`, `_programs` (key → Program), `_max_programs`, `_free_intermediates`, `_generation` |
-| properties to the program being called | `_seq_ops`, `_inverse_memory`, `_recording`, `_freeing` (= `free_intermediates`, not while recording) |
+| properties to the program being called | `_seq_ops`, `_inverse_memory`, `_recording`; `_freeing` is a plain attribute that `Program.__call__` sets around its replay (read by every `fn_next`) |
 | `max_programs`, `free_intermediates`, `_full` | after `resultant_nodes` |
 | `_program_for`, `_contract_key`, `_hashable_arg` | after `trace`; `_hashable_arg` is a module function |
 | `input_node`, `copy_node`, `_recording_program`, `_takes_data_nodes` | before `_add_data_or_set_nodes` |
-| pickling (`torch.save`) and deep copies | `AbstractNode.__getstate__` drops the cached successors (their kernels are local functions), `Program.__getstate__` drops the recording: programs record again after loading |
+| pickling (`torch.save`) and deep copies | `AbstractNode.__getstate__` drops the cached successors (their kernels are local functions), `Program.__getstate__` drops the recording, and `TensorNetwork.__setstate__` resets: programs record again after loading, without the old nodes |
+| tensor arguments | `_check_tensor_arguments`, `_mask_tensors`, `_tensor_ids`, when a new program is made |
+| references that follow moved memory | `AbstractNode.tensor`, `tensor_address`, `_direct_get_tensor`: a node that references another (`set_tensor_from`, `copy_node`) reads through it when that node's memory moved later (into a stack, with `auto_stack`) |
 | `forward`, `trace`, `reset` | `forward` = `self._program_for(*args, **kwargs)(data)`; `trace` resets if full, calls the network, sets `free_intermediates`; `reset` empties `_programs`, increases `_generation`, clears `_eager` and every node's `_successor_caches` |
 | successors | `AbstractNode._successors` (property): `_successor_caches[network._program]` |
 | inverse memory | `_record_in_inverse_memory`, `_check_inverse_memory`: keyed by `node.node_ref()`; `_update_node_info` no longer moves keys |
@@ -488,10 +501,22 @@ and neither record nor check the inverse memory.
   Three tests set `net._tracing` and `net._traced` around eager operations
   to check freeing; they are one test, parametrised, through a `Program`
   with `free_intermediates` (end state and values).
-- A network pickled after `forward` is saved without its recordings and
-  records them again after loading (`torch.save` failed on the local
-  kernel functions; on #3's branch too). The old program's resultant nodes
-  stay until the next `reset`.
+- A network pickled after `forward` is saved without its recordings, and
+  resets itself when loaded (or deep-copied), so it records again with the
+  parameters and `state_dict` keys of the original (`torch.save` failed on
+  the local kernel functions; on #3's branch too, fixed there).
+- A node made with `set_tensor_from` (or `copy_node`) follows the node it
+  references when that node's memory moves into a stack later; it used to
+  lose it (`tensor_address()` gave `None`, which a test pinned as
+  "undesired"; the test now checks the fix). A program of copies recorded
+  before a program that stacks the same nodes raised `KeyError` in its
+  replay.
+- A tensor argument of `contract` other than an existing program's raises
+  a `ValueError` (on `main`, comparing the arguments raised a
+  `RuntimeError`).
+- Eager operations cost about 0.3 µs more than on #3's branch (13.4 vs
+  13.1 µs for `a @ b` on small tensors; #3 itself adds about 1.2 µs over
+  `main`): the successor lookup through the program being called.
 
 ### 4.4 Tests
 
@@ -512,7 +537,12 @@ and neither record nor check the inverse memory.
   marginal), float64 and complex128, freeing on and off: the mixed loss and
   its gradients equal a dense contraction;
 - `copy_node`: shares the tensor and the gradient, new dangling edges,
-  deleted by `reset`, errors; `torch.save`/`torch.load` after a forward;
+  deleted by `reset`, errors; copies and a stacking `MPS` program
+  alternating in both orders, with parameter updates: values and gradients;
+- `torch.save`/`torch.load` after a forward; restored networks
+  (`TestTensorNetwork::test_restored_network_after_forward`, pickled and
+  deep-copied): values, `state_dict` keys, nodes and parameters as the
+  original's; tensor arguments: the same object replays, another raises;
 - input-node errors (also a call without data); `Program(net, fn)`: replays without calling `fn`, with
   inputs set by `node.tensor = t` and another batch size, records again
   after `reset`; errors; a failed recording is recorded again.

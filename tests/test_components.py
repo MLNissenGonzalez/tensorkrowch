@@ -1154,8 +1154,10 @@ class TestSetTensorParamNode:  # MARK: TestSetTensorParamNode
         
         assert node1.tensor_address() == stack.name
         
-        # NOTE: Be aware of this "undesired" behaviour
-        assert node2.tensor_address() == None  #node1's address
+        # node2 follows node1's memory into the stack (it used to lose it:
+        # tensor_address() was None)
+        assert node2.tensor_address() == stack.name
+        assert torch.equal(node2.tensor, node1.tensor)
 
 
 class TestMoveToNetwork:  # MARK: TestMoveToNetwork
@@ -4035,3 +4037,35 @@ class TestProgram:  # MARK: TestProgram
             with torch.no_grad():
                 for param in params:
                     param.add_(0.1 * torch.randn_like(param))
+    
+    def test_tensor_argument(self):
+        class ScaledTN(tk.TensorNetwork):
+            def __init__(self):
+                super().__init__(name='scaled_tn')
+                self.node = tk.randn(shape=(3,), network=self,
+                                     param_node=True, dtype=torch.float64)
+            
+            def contract(self, scale, double=False):
+                result = self.node * scale
+                return result * 2. if double else result
+        
+        net = ScaledTN()
+        net.max_programs = None
+        scale = torch.rand(3, dtype=torch.float64)
+        for _ in range(2):  # the same object: replayed
+            assert torch.allclose(net(None, scale), net.node.tensor * scale)
+        assert torch.allclose(net(None, scale, True),
+                              2 * net.node.tensor * scale)
+        assert len(net._programs) == 2
+        
+        # Another tensor raises, also with the default max_programs
+        with pytest.raises(ValueError, match="'scale'"):
+            net(None, scale.clone())
+        net.max_programs = 1  # resets: 2 programs
+        net(None, scale)
+        with pytest.raises(ValueError, match="'scale'"):
+            net(None, scale.clone())
+        
+        net.reset()
+        other = torch.rand(3, dtype=torch.float64)
+        assert torch.allclose(net(None, other), net.node.tensor * other)
