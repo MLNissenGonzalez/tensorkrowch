@@ -722,13 +722,6 @@ class AbstractNode(ABC):  # MARK: AbstractNode
         program = None if self._network is None else self._network._program
         self._successor_caches[program] = successors
 
-    def __getstate__(self) -> Dict[Text, Any]:
-        # Pickled (or deep-copied) without the operations' cached results,
-        # whose kernels can be local functions; programs record again
-        state = self.__dict__.copy()
-        state['_successor_caches'] = dict()
-        return state
-
     @property
     def name(self) -> Text:
         """
@@ -3952,6 +3945,15 @@ class Successor:  # MARK: Successor
         self.child = child
         self.hints = hints
 
+    def __getstate__(self) -> Dict[Text, Any]:
+        # Pickled (or deep-copied) without the kernel, a local function that
+        # cannot be pickled; the operation plans it again in its next call
+        state = self.__dict__.copy()
+        if isinstance(self.hints, dict) and ('kernel' in self.hints):
+            state['hints'] = {key: value for key, value in self.hints.items()
+                              if key != 'kernel'}
+        return state
+
 
 ###############################################################################
 #                                TENSOR NETWORK                               #
@@ -5490,15 +5492,6 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         else:
             raise TypeError('`key` should be int or str type')
 
-    def __setstate__(self, state: Dict[Text, Any]) -> None:
-        # Unpickled (or deep-copied) without its recordings and the nodes'
-        # successors (see ``Program.__getstate__`` and
-        # ``AbstractNode.__getstate__``): reset, so that the contraction is
-        # recorded again, without the old nodes and stacked parameters next
-        # to the new ones
-        super().__setstate__(state)
-        self.reset()
-
     def __str__(self) -> Text:
         return self.name
 
@@ -5636,11 +5629,11 @@ class Program:  # MARK: Program
         return self._network
 
     def __getstate__(self) -> Dict[Text, Any]:
-        # Pickled (or deep-copied) without its recording, whose kernels are
-        # local functions: it is recorded again in its next call
+        # Pickled (or deep-copied) with its recording but without its steps,
+        # which hold the operations' functions (local functions cannot be
+        # pickled): they are found again in the next call
         state = self.__dict__.copy()
-        state.update(_seq_ops=[], _steps=None, _inverse_memory=dict(),
-                     _generation=None)
+        state['_steps'] = None
         return state
 
     def __call__(self,
@@ -5698,6 +5691,8 @@ class Program:  # MARK: Program
                     'call (one tensor per input node); without it, it would '
                     'contract the previous call\'s data, or the placeholders')
             if recorded or (inputs is not None):
+                if self._steps is None:  # unpickled (or deep-copied)
+                    self._find_steps()
                 net._freeing = net._free_intermediates
                 for fn_next, successor, args in self._steps:
                     fn_next(successor, *args)
@@ -5755,7 +5750,11 @@ class Program:  # MARK: Program
                 self._inverse_memory[node.node_ref()]['erase'] = False
         self._outputs = outputs
         
-        # Successors are found once, so that replaying does not search them
+        self._find_steps()
+
+    def _find_steps(self) -> None:
+        """The recorded operations, with their successors (in the program's
+        cache), so that replaying does not search them."""
         operations = TensorNetwork.operations
         self._steps = [(operations[name].fn_next,
                         operations[name].check_first(*args),

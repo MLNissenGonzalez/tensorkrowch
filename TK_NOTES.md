@@ -256,6 +256,17 @@ variables) needed around tensorkrowch, items 1 and 2. Variants and measurements 
 - `contract_edges`' successors keep the key `(edges, node1, node2)` without
   `keep`/`rescale`; their hints are now the kernel. `a @ b` costs about +1 µs
   per call in lookup and replay (12.1 → 13.0 µs on small tensors).
+- Pickling after a forward (review of #3): `contract_edges` on the core keeps
+  its kernel, a local function, in its successors, and `torch.save` failed.
+  `Successor.__getstate__` drops the kernel and the core's `fn_next` plans it
+  again when it is missing. The recording (nodes, successors, parameters)
+  survives, as on `main`. A first version reset the network on restore,
+  which stopped training (the optimizer held the per-node parameters),
+  crashed for a node restored before its network, and lost results of
+  operations called by hand.
+- `contract_between(..., rescale=True)` contracts nodes that share nothing
+  as an outer product, as a contraction path's step may; without `rescale`
+  it still raises.
 
 ## Since: `recorded-programs` (issue #2, 2026-10-28/30)
 
@@ -300,7 +311,8 @@ are in `docs/programs.md`.
   that name `_tracing`/`_traced` describe the code before this branch.
 - Second round: references (`set_tensor_from`, `copy_node`) follow a node
   whose memory moves into a stack later (it raised `KeyError` in replays, and
-  `tensor_address()` was `None`); restored networks reset themselves; a new
+  `tensor_address()` was `None`); restored networks keep their programs
+  (`Program.__getstate__` drops only `_steps`, found again); a new
   tensor argument where a program had another raises `ValueError`; `_freeing`
   is a plain attribute set around replays (eager `a @ b` +0.3 µs over
   `contraction-primitives`).

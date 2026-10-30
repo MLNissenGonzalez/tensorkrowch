@@ -449,7 +449,7 @@ contraction method that returns several outputs from one program.
 | `max_programs`, `free_intermediates`, `_full` | after `resultant_nodes` |
 | `_program_for`, `_contract_key`, `_hashable_arg` | after `trace`; `_hashable_arg` is a module function |
 | `input_node`, `copy_node`, `_recording_program`, `_takes_data_nodes` | before `_add_data_or_set_nodes` |
-| pickling (`torch.save`) and deep copies | `AbstractNode.__getstate__` drops the cached successors (their kernels are local functions), `Program.__getstate__` drops the recording, and `TensorNetwork.__setstate__` resets: programs record again after loading, without the old nodes |
+| pickling (`torch.save`) and deep copies | the recording survives, as on `main`: `Successor.__getstate__` (on #3) drops the kernel, a local function, which the core's `fn_next` plans again; `Program.__getstate__` drops `_steps` (they hold the operations' local functions), which `__call__` finds again (`_find_steps`) |
 | tensor arguments | `_check_tensor_arguments`, `_mask_tensors`, `_tensor_ids`, when a new program is made |
 | references that follow moved memory | `AbstractNode.tensor`, `tensor_address`, `_direct_get_tensor`: a node that references another (`set_tensor_from`, `copy_node`) reads through it when that node's memory moved later (into a stack, with `auto_stack`) |
 | `forward`, `trace`, `reset` | `forward` = `self._program_for(*args, **kwargs)(data)`; `trace` resets if full, calls the network, sets `free_intermediates`; `reset` empties `_programs`, increases `_generation`, clears `_eager` and every node's `_successor_caches` |
@@ -501,10 +501,17 @@ and neither record nor check the inverse memory.
   Three tests set `net._tracing` and `net._traced` around eager operations
   to check freeing; they are one test, parametrised, through a `Program`
   with `free_intermediates` (end state and values).
-- A network pickled after `forward` is saved without its recordings, and
-  resets itself when loaded (or deep-copied), so it records again with the
-  parameters and `state_dict` keys of the original (`torch.save` failed on
-  the local kernel functions; on #3's branch too, fixed there).
+- A network pickled or deep-copied after `forward` keeps its programs, nodes
+  and parameters, as on `main`; only the local functions (kernels, steps)
+  are found again in the next call (`torch.save` failed on them; on #3's
+  branch too, fixed there). Training goes on after a load with the same
+  parameters and `state_dict` keys. A network with a `tk.Program` whose
+  function is a lambda cannot be pickled (the program is a key of its
+  nodes' caches), as with any module that holds a lambda; a module-level
+  function or a `functools.partial` can.
+- A single-element tensor among `contract`'s arguments that changes between
+  calls raises (see the tensor arguments above); on `main` it compared to
+  one bool, so the network was reset and recorded again.
 - A node made with `set_tensor_from` (or `copy_node`) follows the node it
   references when that node's memory moves into a stack later; it used to
   lose it (`tensor_address()` gave `None`, which a test pinned as
@@ -539,10 +546,13 @@ and neither record nor check the inverse memory.
 - `copy_node`: shares the tensor and the gradient, new dangling edges,
   deleted by `reset`, errors; copies and a stacking `MPS` program
   alternating in both orders, with parameter updates: values and gradients;
-- `torch.save`/`torch.load` after a forward; restored networks
-  (`TestTensorNetwork::test_restored_network_after_forward`, pickled and
-  deep-copied): values, `state_dict` keys, nodes and parameters as the
-  original's; tensor arguments: the same object replays, another raises;
+- `torch.save`/`torch.load` after a forward (programs with input nodes);
+  restored networks (`TestTensorNetwork::test_restored_network_after_forward`
+  and `test_restored_nodes_and_results`, on #3, pickled and deep-copied):
+  values (also another batch size), `state_dict` keys and parameters right
+  after loading, the same nodes, training goes on, a node restored before
+  its network, results of operations called by hand; tensor arguments: the
+  same object replays, another raises;
 - input-node errors (also a call without data); `Program(net, fn)`: replays without calling `fn`, with
   inputs set by `node.tensor = t` and another batch size, records again
   after `reset`; errors; a failed recording is recorded again.

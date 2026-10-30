@@ -127,6 +127,10 @@ returns is its `fn_next`.
 - Code **before** `return` (the *planner*) sees nodes and runs once per
   structure. Use it for axis lookups, permutations and shapes that do not
   change. Do not read tensor values there: they are frozen at the first call.
+  It can run again: a pickled or deep-copied network keeps its resultant
+  nodes but not their kernels (local functions cannot be pickled), so each
+  operation plans its kernel again in its next call. A planner should only
+  plan, with no other effects.
 - Code **inside** the kernel sees tensors and runs every time. Control flow
   on tensor values (`torch.where`, even Python `if` on a tensor) is fine
   there, because the kernel is re-executed.

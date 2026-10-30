@@ -3351,10 +3351,20 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
         assert net._programs == dict()
         assert net.resultant_nodes == dict()
 
+    @staticmethod
+    def _restore(obj, how):
+        if how == 'deepcopy':
+            return copy.deepcopy(obj)
+        buffer = io.BytesIO()
+        torch.save(obj, buffer)
+        buffer.seek(0)
+        return torch.load(buffer, weights_only=False)
+
     @pytest.mark.parametrize('restore', ['pickle', 'deepcopy'])
     def test_restored_network_after_forward(self, restore):
-        # Successors are not pickled (kernels can be local functions): the
-        # restored network is reset and records its contraction again
+        # Successors are pickled without their kernels (local functions),
+        # which the operations plan again: the restored network replays its
+        # contraction, with the same nodes and parameters
         mps = tk.models.MPS(n_sites=4, phys_dim=2, bond_dim=2,
                             dtype=torch.float64)
         x = torch.rand(3, 4, 2, dtype=torch.float64)
@@ -3363,22 +3373,51 @@ class TestTensorNetwork:  # MARK: TestTensorNetwork
             expected = mps(x)
         keys = sorted(mps.state_dict())
         n_resultant = len(mps.resultant_nodes)
+        n_params = len(list(mps.parameters()))
         
-        if restore == 'pickle':
-            buffer = io.BytesIO()
-            torch.save(mps, buffer)
-            buffer.seek(0)
-            restored = torch.load(buffer, weights_only=False)
-        else:
-            restored = copy.deepcopy(mps)
-        assert restored.resultant_nodes == dict()
-        
+        restored = self._restore(mps, restore)
+        assert sorted(restored.state_dict()) == keys
+        assert len(list(restored.parameters())) == n_params
         for _ in range(2):
             assert torch.allclose(restored(x), expected)
-        assert sorted(restored.state_dict()) == keys
         assert len(restored.resultant_nodes) == n_resultant
-        assert len(list(restored.parameters())) == \
-            len(list(mps.parameters()))
+        # Another batch size
+        y = torch.rand(5, 4, 2, dtype=torch.float64)
+        with torch.no_grad():
+            assert torch.allclose(restored(y), mps(y))
+        
+        # Training goes on: the optimizer's parameters are the ones used
+        optimizer = torch.optim.SGD(restored.parameters(), lr=0.1)
+        before = restored(x).detach()
+        restored(x).sum().backward()
+        optimizer.step()
+        assert not torch.allclose(restored(x), before)
+        
+        # And reset still works
+        values = restored(x).detach()
+        restored.reset()
+        assert torch.allclose(restored(x), values)
+
+    @pytest.mark.parametrize('restore', ['pickle', 'deepcopy'])
+    def test_restored_nodes_and_results(self, restore):
+        mps = tk.models.MPS(n_sites=3, phys_dim=2, bond_dim=2,
+                            dtype=torch.float64)
+        with torch.no_grad():
+            mps(torch.rand(3, 3, 2, dtype=torch.float64))
+        # A node restored before its network
+        node, restored = self._restore([mps.mats_env[0], mps], restore)
+        assert torch.equal(node.tensor, mps.mats_env[0].tensor)
+        assert node.network is restored
+        
+        # Results of operations called by hand keep their tensors
+        net = tk.TensorNetwork()
+        a = tk.randn(shape=(2, 3), network=net, dtype=torch.float64)
+        b = tk.randn(shape=(3, 4), network=net, dtype=torch.float64)
+        a[1] ^ b[0]
+        c = a @ b
+        restored_net, restored_c = self._restore([net, c], restore)
+        assert torch.equal(restored_c.tensor, c.tensor)
+        assert restored_c.network is restored_net
 
     def test_forward_several_outputs_error(self):
         class WrongOutputsTN(tk.TensorNetwork):

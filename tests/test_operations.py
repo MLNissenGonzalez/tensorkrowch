@@ -5272,10 +5272,29 @@ class TestContractKeepRescale:  # MARK: TestContractKeepRescale
                               torch.einsum('ba,ac->abc',
                                            node1.tensor, node3.tensor))
         
-        # Nothing shared
+        # Nothing shared: an error, unless the contraction rescales
         node4 = tk.randn(shape=(2,), axes_names=('c',), network=net)
         with pytest.raises(ValueError, match='No batch edges, kept edges'):
             node1 @ node4
+    
+    @pytest.mark.parametrize('batch', [False, True])
+    def test_rescale_nothing_shared(self, batch):
+        # A step of a contraction path may pair nodes that share nothing
+        net = tk.TensorNetwork()
+        node1 = tk.randn(shape=(2, 3), axes_names=('a', 'b'), network=net,
+                         dtype=torch.float64)
+        shape, names = ((5, 4), ('batch', 'c')) if batch else ((4,), ('c',))
+        node2 = tk.randn(shape=shape, axes_names=names, network=net,
+                         dtype=torch.float64)
+        for _ in range(2):  # recorded, then replayed
+            result, log_scale = tk.contract_between(node1, node2,
+                                                    rescale=True)
+            assert result.axes_names == ['a', 'b'] + list(names)
+            value = result.tensor * log_scale.tensor.exp().reshape(
+                (1, 1, 5, 1) if batch else ())
+            expected = torch.einsum('ab,...c->ab...c', node1.tensor,
+                                    node2.tensor)
+            assert torch.allclose(value, expected)
     
     def test_rescale(self):
         net = tk.TensorNetwork()
