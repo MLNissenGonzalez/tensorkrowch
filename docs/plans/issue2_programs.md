@@ -43,6 +43,16 @@ runs it; `forward` raises `NotImplementedError`. Read only; nothing here was cha
 7. `log_abs_phase` becomes two lines of torch once `forward` returns several outputs
    (on `main`): the log-scales are ordinary outputs then.
 
+**Correction (2026-10-30, measured after implementing #2).** Points 2 and 3 are
+not a speed problem. Keeping one's own nodes per pattern and re-running the
+operations through their lookups is as fast as replaying a program (1.42 vs
+1.39 ms per forward with grad, 1.00 vs 1.01 ms without, on a 12-variable chain;
+`docs/programs.md` §2.4): kernels and per-operation bookkeeping dominate, not the
+lookup. The downstream design was sound in substance (its per-plan nodes are the
+per-program caches, by hand). What remains of the critique: it uses private tk
+API, frees by hand, and is specific to `TreeNetwork`; and point 4's growth is
+the same with programs that are never freed (`max_programs=None`).
+
 Why this was not surfaced earlier: the downstream repo was first read in this session; the
 operation work before it looked only at tensorkrowch.
 
