@@ -1268,6 +1268,16 @@ class TestTensorOps:  # MARK: TestTensorOps
         
         # Repeat
         node2 = tk.conj(node1)
+    
+    def test_conj_real_param_grad(self):
+        # conj of a real tensor returns the parameter itself, which a
+        # resultant node used to detach in the first call
+        node = tk.randn(shape=(2, 3), param_node=True, dtype=torch.float64)
+        for _ in range(2):
+            result = tk.conj(node)
+            grad, = torch.autograd.grad((result.tensor ** 2).sum(),
+                                        [node.tensor])
+            assert torch.allclose(grad, 2 * node.tensor)
 
 
 def _split_rank_high_rank_tensor():
@@ -5587,7 +5597,7 @@ class TestMergeSplitEdge:  # MARK: TestMergeSplitEdge
         result3 = net()
 
         assert result3.shape == (7, 5)
-        assert net.program()._traced
+        assert net.free_intermediates
 
     def test_merge_dangling_edges_in_place(self):
         net = tk.TensorNetwork()

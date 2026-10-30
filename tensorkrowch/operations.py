@@ -140,6 +140,10 @@ def _create_resultant_from_axes(axes: Sequence[Union[Axis, Text]],
         raise ValueError(
             f'Tensor with {tensor.dim()} dimensions cannot be the tensor of a '
             f'node with {len(axes)} axes')
+    if isinstance(tensor, Parameter):
+        # A kernel can return an operand's parameter itself (``conj`` of a
+        # real tensor), which a Node would detach
+        tensor = tensor.view_as(tensor)
     
     axes_names = []
     for i, axis in enumerate(axes):

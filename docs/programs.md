@@ -1,16 +1,19 @@
 # Programs: several recorded contractions per network
 
-**In short.** A loss may contract a network in several ways (here: the
-amplitudes and the norm). Set `net.max_programs = None` once and call the
-network as usual, `net(data, *args)`, for each contraction. The first call
-with each set of `contract` arguments records it; every later call with the
-same arguments replays it. Nothing has to be declared before the loop.
-`trace` is optional: it frees intermediate tensors as soon as they are used
-(memory, not speed).
+**In short.** A loss may contract a network in several ways: the amplitudes
+and the norm, or marginals over different sets of observed variables. Set
+`net.max_programs = None` once and call the network as usual,
+`net(data, *args)`, for each contraction. The first call with each set of
+`contract` arguments records it (a *program*); every later call with the
+same arguments replays it. Nothing is declared before the loop. Data that
+differ between contractions go into *input nodes* that `contract` creates.
+`net.free_intermediates = True` (optional) makes every program erase its
+intermediate tensors as soon as it has used them: memory, not speed.
 
-This document has four parts: the recipe for a training loop (§1), what
-happens underneath (§2), design choices (§3) and implementation (§4). It
-builds on `docs/custom_operations.md` (operations and successors).
+Parts: the recipe for a training loop (§1), what happens underneath (§2),
+design choices (§3), implementation (§4), and a larger example with the
+contraction interface of tpm-tn-benchmark (§5). It builds on
+`docs/custom_operations.md` (operations and successors).
 
 
 ## 1. A training loop with several contractions
@@ -19,8 +22,7 @@ builds on `docs/custom_operations.md` (operations and successors).
 
 $-\ln p(x) = -\ln|\psi(x)|^2 + \ln Z$ needs two contractions per step,
 both before the first `backward`: the amplitudes $\psi(x)$ of the batch,
-and $Z = \langle\psi|\psi
-angle$. A network whose `contract` takes an
+and $Z = \langle\psi|\psi\rangle$. A network whose `contract` takes an
 argument that says which:
 
 ```python
@@ -81,6 +83,7 @@ def nll(net, x):
     return -(log_psi2 - log_Z).mean()
 
 
+torch.manual_seed(0)
 n, d, r = 12, 3, 8
 net = BornChain(n, d, r)
 net.max_programs = None        # keep both programs (default: 1)
@@ -95,7 +98,7 @@ for step in range(100):
 print(f'{loss.item():.3f}', len(net._programs))
 ```
 
-Output: `9.224 2` (the loss after 100 steps; two programs). The loss and
+Output: `9.025 2` (the loss after 100 steps; two programs). The loss and
 its gradients equal those of a dense contraction.
 
 What happens in the loop:
@@ -112,92 +115,103 @@ wiring) does not run again.
 ### 1.2 What you have to do
 
 1. **Write `contract` with the contraction choices as arguments** (here
-   `norm`). Only arguments that change *which* contraction is done belong
-   there; the data goes through `net(data, ...)`. Arguments are compared
-   after normalisation (`net(norm=True)` and `net(None, True)` are the same
-   program); they must be hashable (lists, tuples, dicts and sets of
-   hashable objects are turned into tuples).
-2. **Set `max_programs`** to at least the number of different argument sets
-   the loss uses (`None`: no limit). With the default, 1, every switch
-   between `net(x)` and `net(norm=True)` warns, resets the network and
-   records again: 9.1 ms per training step above, against 3.3 ms.
+   `norm`; in §5 `other` and `observed`). Only arguments that change *which*
+   contraction is done belong there; the data goes through
+   `net(data, ...)`. Arguments are compared after normalisation
+   (`net(norm=True)` and `net(None, True)` are the same program); they must
+   be hashable (lists, tuples, dicts and sets of hashable objects are turned
+   into tuples).
+2. **Set `max_programs`** to at least the number of argument sets the loss
+   uses (`None`: no limit). With the default, 1, every switch between
+   `net(x)` and `net(norm=True)` warns, resets the network and records
+   again: 9.1 ms per training step above, against 3.3 ms.
 3. **Create the optimizer after the first step** if the network stacks its
    parameters (`auto_stack`, as tk's models do): the first recording
-   replaces the parameters of stacked nodes by the stack's. (The example
-   does not stack, so it creates the optimizer first.)
-4. **Optionally `trace`** (§1.3).
-5. **Choose the contraction order well**: the order `contract` uses is what
-   is replayed. The zip-up order above keeps (r, r) environments; contracting
-   all transfer matrices first would build `n` tensors of r⁴ entries.
+   replaces the parameters of stacked nodes by the stack's. (The examples
+   do not stack, so they create the optimizer first.)
+4. **Choose the contraction order well**: the order `contract` uses is what
+   is replayed. The zip-up order above keeps (r, r) environments;
+   contracting all transfer matrices first would build `n` tensors of r⁴
+   entries.
+5. **Optionally set `free_intermediates`** (§1.3).
 
-### 1.3 `trace`: memory, not speed
+### 1.3 `free_intermediates`: memory, not speed
 
-`forward` replays from the second call whether or not the network is
-traced. Tracing a program makes it erase each intermediate tensor (the
-resultant nodes' and the data nodes' tensors) as soon as the program has
-read it for the last time, so the network holds nothing between calls:
+`forward` replays from the second call in any case. With
+`net.free_intermediates = True`, every program erases each intermediate
+tensor (of resultant and data nodes) as soon as it has read it for the last
+time, so the network holds nothing between calls:
 
 | n = 100, r = 64, batch 256, under `torch.no_grad` | one call | intermediates the network holds afterwards |
 |---|---|---|
-| not traced | 27 ms | 64 MB |
-| traced | 27 ms | 0 MB |
+| off | 27 ms | 64 MB |
+| on | 27 ms | 0 MB |
 
-With autograd, the graph keeps what `backward` needs anyway; tracing then
-only drops the network's own references. Without autograd (evaluation,
+With autograd, the graph keeps what `backward` needs anyway; then it only
+drops the network's own references. Without autograd (evaluation,
 sampling), it also lowers the peak during the call.
 
-Today a program is traced by calling `trace` with its arguments, once per
-program, before or after the first step:
+It is one setting for the network: it holds for every program, recorded
+before or after it is set, and `reset` keeps it. Every recording counts how
+often each tensor is read, so it can be switched on at any time, e.g. after
+the first step. `trace(example, *args)` records the program of `args` and
+switches it on.
 
-```python
-net.max_programs = None
-net.trace(x[:1])               # program of contract()
-net.trace(None, norm=True)     # program of contract(norm=True)
-```
-
-Every recording already counts how often each tensor is read; `trace` only
-switches the freeing on (and records the program first if it was not). If
-the network keeps `max_programs` programs already, `trace` resets it
-first. (Whether `trace` should instead be one switch for all programs is an
-open question, §3.8.)
+It is off by default because it changes what a network shows after a call:
+the tensors of intermediate nodes are `None`. Code that reads them (when
+debugging, or an operation called after `forward` on an intermediate node)
+would fail, and the gain is memory only.
 
 ### 1.4 Inputs
 
 A program reads the tensors its nodes hold when it is called, as a recorded
-CUDA graph reads its input buffers:
+CUDA graph reads its input buffers. A network takes its data in one of two
+ways:
 
-- the network's `data` nodes, set by `net(data, ...)`;
-- the parameters, read through any node that shares their memory (the
-  copies made with `set_tensor_from` above);
-- any other node whose tensor is set before the call (`node.tensor = t`).
+- **data nodes** (`set_data_nodes`, as tk's models do): one set for the
+  network, attached to the leaf nodes' input edges once; `net(data, ...)`
+  adds `data` to them before the program runs. Good when every contraction
+  reads the same variables (§1.1).
+- **input nodes** (`self.input_node(shape, axes_names)`, called inside
+  `contract`): each program has its own, created while it is recorded, so
+  each contraction can read different variables (§1.5).
 
-### 1.5 What does not work yet: a different set of observed variables per contraction
+The parameters are read through any node that shares their memory (the
+copies made with `set_tensor_from`).
 
-A loss like the chain rule over an ordering,
-$-\ln p(x) = -\sum_k \ln p(x_k \mid x_{<k})$, with
-$p(x_k \mid x_{<k}) = P(x_{\le k}) / P(x_{<k})$, needs one marginal per
-prefix: a contraction where $x_{<k}$ are observed (contracted with
-$arphi(x_i)$) and the rest summed. Each pattern needs its own input
-nodes (the feature leg of a variable is connected to its data in one pattern
-and summed in another), and the network's data nodes are one set, attached
-once. Today the subclass would create each pattern's input nodes inside
-`contract` (with the first batch's tensors) and set them itself before each
-later call: two code paths for the same inputs. §3.7 has a design that
-removes this; it is not implemented.
+### 1.5 Different observed variables per contraction: input nodes
 
-The same holds for tk's `MPS`: which sites are inputs (`in_features`) is
-state of the network, not an argument of `contract` (changing it resets
-the network). Its `contract` arguments (`inline_input`,
-`marginalize_output`, ...) choose how the same pattern is contracted;
-`marginalize_output=True` sums the output sites against a conjugated copy.
+A marginal $P(x_S)$ observes the variables in $S$ and sums the others. A
+variable's leg is connected to its data in one pattern and summed in
+another, so each pattern contracts its own copies of the cores, and its
+data enters through its own input nodes:
+
+```python
+def contract(self, other=None, observed=()):
+    ...
+    for i in observed:
+        rho = self.input_node(shape=(1, d, d),            # placeholder
+                              axes_names=('batch', 'ket', 'bra'))
+        rho['ket'] ^ ket[i]['input']
+        rho['bra'] ^ bra[i]['input']
+    ...
+
+net(data, other=net, observed=(0, 2, 3))   # data: one tensor per input node
+```
+
+The input node holds zeros of batch size 1. The first call records the
+program on these placeholders, then fills them with `data` (a list with
+one tensor per input node, in the order `contract` created them) and
+replays; later calls fill and replay. §5 is a full example, with a loss
+that mixes the likelihood and a marginal likelihood.
 
 ### 1.6 `Program` objects
 
-`net(data, *args)` is `net.program(*args)(data)`: `net.program(*args)`
-returns the program of those arguments (made, not yet recorded, if it does
-not exist). A loop never needs it. `tk.Program(net, fn)` records a function
-other than `contract` (no arguments, returns a node or a tuple of nodes);
-the caller keeps it, and it is recorded again after a `reset`:
+`net(data, *args)` is the interface. Each set of arguments is a
+`tk.Program` the network keeps; a loop never handles them.
+`tk.Program(net, fn)` records a function other than `contract` (no
+arguments, returns a node or a tuple of nodes); the caller keeps it, and it
+is recorded again after a `reset`:
 
 ```python
 program = tk.Program(net, lambda: (vector @ node).renormalize())
@@ -211,11 +225,14 @@ y = program()           # records the first time, replays afterwards
 |---|---|
 | `max_programs` not an int or `None` (or a bool) | `TypeError` |
 | `max_programs < 1` | `ValueError` |
+| `free_intermediates` not a bool | `TypeError` |
 | arguments of `contract` not hashable | `TypeError` |
+| `input_node` outside a recording, or in a network with data nodes | `ValueError` |
+| `data` not a list with one tensor per input node | `ValueError` |
+| `data` for a program without input nodes, in a network without data nodes | `TypeError` |
 | `Program(net, fn)` with `net` not a `TensorNetwork` or `fn` not callable | `TypeError` |
 | `fn` (or `contract`) returns something other than a node or a tuple of nodes | `TypeError` |
 | a program called while another program of the network is being recorded | `ValueError` |
-| `trace` on a network whose `forward` does not call a program | `ValueError` |
 
 If `fn` raises during the recording, the partial recording is dropped and
 the next call records again.
@@ -241,24 +258,24 @@ reset and a recording twice per step.
   cores, `core @ data`) share the entry: the second finds it, computes it,
   and does not record it. Its replay then skips the step and reads what the
   first contraction last computed: wrong values, silently.
-- **The inverse memory** (what `trace` uses to free tensors) was keyed by
-  node *names*; tk renames `x` to `x_0` when a second `x` appears, and
-  the traced replay then failed with a `KeyError`.
+- **The inverse memory** (what freeing uses) was keyed by node *names*; tk
+  renames `x` to `x_0` when a second `x` appears, and the freeing replay
+  then failed with a `KeyError`.
 
 ### 2.3 What changed
 
-- Each program has its own successor cache, `_seq_ops` and inverse memory.
-  Operations reach them through the network (`net._program` is the program
-  being called), so no operation changed.
+- A program is an object that holds one recording: its `_seq_ops`, its
+  successor cache, its inverse memory, its outputs and its input nodes. The
+  network keeps a dict from (normalised) `contract` arguments to programs,
+  and `forward(data, *args)` runs the program of `args`.
 - The inverse memory is keyed by the node that stores the memory.
-- `forward(data, *args)` is `self.program(*args)(data)`.
 
 ### 2.4 Speed: what replay saves, and what it does not
 
 Replay skips `contract`'s Python and each operation's cache lookup. Each
 operation still costs its kernel and the bookkeeping around it (reading the
-operands' tensors, setting the result's), which dominate. Measured on the
-example's network (n = 12, r = 8, batch 64), forward only:
+operands' tensors, setting the result's), which dominate. Measured on §1.1's
+network (n = 12, r = 8, batch 64), forward only:
 
 | | with grad | no grad |
 |---|---|---|
@@ -280,37 +297,61 @@ training step in §1.2, because nothing is reset and recorded again.
 - **(a) Programs keyed by the arguments, inside the network**: `forward`
   looks up the program of its arguments; the public interface gains only
   the number of programs kept.
-- **(b) A program object** (`program = net.program(*args)`,
-  `program(data)`), which owns its recording and shares the network's
-  parameters.
+- **(b) A program object** (`program(data)`), which owns its recording and
+  shares the network's parameters.
 
 Chosen: both, as one mechanism. The object of (b) holds the state; the
-network's dict of (a) maps arguments to objects, and `forward` is
-`self.program(*args)(data)`. The old single recording is the one-key case
-with `max_programs = 1`, not a second code path. (a) alone needs per-key
-dicts of the same state inside the network and has no place for a function
-other than `contract`; (b) alone leaves `forward` to the user.
+network's dict of (a) maps arguments to objects, and `forward` runs the
+program of its arguments. The old single recording is the one-key case with
+`max_programs = 1`, not a second code path. The lookup of a program by
+arguments is private (`_program_for`): users call `forward`. `tk.Program`
+stays public for functions other than `contract`.
 
-### 3.2 State through the network, not through the operations
+### 3.2 How operations write into the program being called
 
-The operations (six of them hand-written: `split`, `merge_edges`,
-`split_edge`, `stack`, `unbind`, `einsum`) use `net._seq_ops`,
-`net._tracing`, `net._traced`, `net._inverse_memory` and
-`node._successors`. These became properties that resolve to the program
-being called. Rejected: passing the program through every operation (an
-argument threaded through every signature), and moving the six operations
-onto the core first (larger, and not needed here).
+`contract` is written with node operations (`@`, `stack`, `conj`,
+`contract_between`, custom `tk.operation`s, ...); they are what a program
+records. Plain PyTorch on tensors inside `contract` is not recorded (that is
+what `tk.operation` is for). While recording, each operation appends itself
+to "the recording", caches its result node, and counts its reads; while
+replaying, it computes and (with `free_intermediates`) frees.
 
-### 3.3 Per-program successor caches
+Before, "the recording" was a set of fields of the network
+(`net._seq_ops`, `net._tracing`, `net._traced`, `net._inverse_memory`, and
+`node._successors` on the operands), read and written by every operation,
+six of which (`split`, `merge_edges`, `split_edge`, `stack`, `unbind`,
+`einsum`) do it in their own code. Those names now resolve to the fields of
+the program being called (`net._program`): the network sets it for the
+duration of a call. So no operation changed. Rejected: passing the program
+to every operation (an argument threaded through every signature), and
+rewriting the six operations on the shared core first (larger, and not
+needed for this).
 
-Each node keeps one successor dict per program
-(`node._successor_caches[program]`). Rejected: sharing results and
-appending the step to the second program when it hits the first one's
-cache. That needs the operands of every hit recorded in the second program's
-inverse memory, which `Operation.__call__` cannot do (it does not know the
-operands), and it couples programs: one traced replay frees a tensor the
-other has not recomputed. Cost of isolation: an operation common to two
-programs is computed in each.
+### 3.3 Each program computes its own results
+
+An operation's result is cached per program: each node keeps one successor
+dict per program (`node._successor_caches[program]`). Two programs never
+share a result node, even when they do the same operation on the same
+nodes. Rejected: letting the second program use the first one's result and
+appending the step to the second program's recording. That needs the
+step's operands counted in the second program's inverse memory, which the
+generic `Operation.__call__` cannot do (it does not know which arguments are
+operands), and it couples programs: one program's freeing would erase a
+tensor the other has not recomputed.
+
+What isolation costs is structural, not data-dependent: only an operation
+on the *same operand nodes* with the same arguments could be shared. With
+per-pattern copies of the cores (which the one-edge-per-axis model needs
+anyway, §1.5), two programs never operate on the same nodes, so there was
+nothing to share. Mathematically equal subcomputations in different
+patterns are recomputed: the left environment of $x_0 \dots x_k$ is
+contracted in every marginal that observes those variables. Rescaling does
+not change this (each pattern rescales its own environments). For a loss
+over all prefixes of an order (the chain rule with weights $\alpha_k$), $n$
+prefix programs cost $O(n^2)$ site contractions, where one sweep that keeps
+every left environment, and returns every prefix marginal as one of several
+outputs of one program, costs $O(n)$. That sharing is the contraction
+method's job, not the replay's (§3.9).
 
 ### 3.4 Freeing all programs at once
 
@@ -322,58 +363,46 @@ quadratic renaming of `TK_NOTES.md`); and with `auto_stack`, the first
 program to stack the parameters owns the `ParamStackNode` the others point
 to.
 
-### 3.5 Inputs as nodes
+### 3.5 Input nodes: recorded on placeholders
 
-A program reads its nodes' tensors; the network's data nodes are set by
-`program(data)` as `forward` did. Considered: a list of input nodes
-returned by the function with its outputs (`fn() -> (inputs, outputs)`,
-`program(*tensors)`), a second return convention. For per-pattern inputs
-see §3.7.
+Per-pattern data needs nodes that exist only in that pattern's
+contraction, so `contract` must create them; but `contract` receives only
+its arguments, not the data, and a recording computes. So an input node
+starts as a placeholder (zeros, batch size 1, the dtype and device of the
+network's parameters): the program is recorded on it, then filled and
+replayed. The first call computes twice, once on one sample. This is what
+`trace` always did: record on an example of zeros, then run.
 
-### 3.6 `trace` through the network
+Considered: the function returning its inputs with its outputs
+(`fn() -> (inputs, outputs)`, `program(*tensors)`), a second return
+convention; and inputs set by the caller on nodes it keeps (`node.tensor = t`
+before each call), which needs the caller to create them during the
+recording and keep a registry per pattern: two code paths for the same
+inputs.
 
-`trace` calls the network (`self(example, *args)`), because subclasses
-override `forward` and may turn their arguments into other `contract`
-arguments; so it marks the program the call ran (`net._last_program`). For
-that, every recording counts reads in the inverse memory (before, only
+A network takes its data either in data nodes or in input nodes;
+`input_node` raises in a network with data nodes, so `net(data)` always
+knows where `data` goes (data nodes if the network has them or overrides
+`set_data_nodes`, else the program's input nodes). Input nodes are virtual
+nodes: `free_intermediates` does not erase them (they hold the inputs until
+the next call), and `reset` deletes them with their program.
+
+### 3.6 Freeing: one setting for the network
+
+`free_intermediates` holds for every program. Rejected: freeing per program
+(`trace(example, *args)` once per argument set), which needs the list of
+argument sets before the loop. Every recording counts reads (before, only
 `trace`'s did): a dict update per operand while recording, no effect until
-freeing is on.
+freeing is on. `trace` records through `self(example, *args)`, because
+subclasses override `forward` and may turn their arguments into others
+(§5's `forward` turns values into input tensors).
 
-### 3.7 Open: per-pattern inputs
+### 3.7 Replay without the lookup
 
-For §1.5. Inputs that a program creates while it is recorded would be its
-own: `contract` creates them with a placeholder of batch size 1 (as
-`trace`'s example of zeros), the program records on the placeholders, then
-fills them with the call's data and replays (the first call computes twice,
-the first time on one sample). `net(data, *args)` fills the program's own
-inputs if it has any, else the network's data nodes. A sketch:
+At the end of a recording, each step is resolved once to
+`(fn_next, successor, args)`; the replay calls `fn_next` directly (§2.4).
 
-```python
-def contract(self, observed):            # observed: a tuple of variables
-    ...                                  # copies of the cores for this pattern
-    for i in observed:
-        phi = self.input(shape=(1, d), axes_names=('batch', 'feature'))
-        phi['feature'] ^ ket[i]['input']
-    ...
-
-def nll(net, x):                         # chain rule over the order 0..n-1
-    phi = net.feature_map(x)             # (batch, n, d)
-    log_P = [net([phi[:, i] for i in range(k)], observed=tuple(range(k)))
-             for k in range(n + 1)]      # n + 1 programs, recorded once
-    return -(log_P[n] - log_P[0]).mean()
-```
-
-(For this particular loss the sum telescopes to $-\ln P(x) + \ln Z$, two
-contractions; the sketch shows the mechanism, which a loss with weights
-$lpha_k$ per term, or one over several orders, needs.)
-
-### 3.8 Open: one switch for freeing
-
-`trace(example, *args)` per program needs the list of argument sets in
-advance. Since every recording counts reads, freeing could be a network
-setting that holds for every program, recorded or not (like `auto_stack`).
-
-### 3.9 `MPS.sample` stays as it is
+### 3.8 `MPS.sample` stays as it is
 
 Its fixed step networks can be programs (`test_program_of_function` is
 such a step), but `sample` does not get shorter: each step's expression
@@ -381,17 +410,20 @@ becomes a lambda, one for one, and the steps read their output node's axes,
 which a program's tensors-only return does not give. Gain: 13 of 70 µs per
 step.
 
-### 3.10 Downstream: per-pattern plans
+### 3.9 Downstream: per-pattern plans and a deep contraction method
 
 A tree network contracted in many patterns kept one plan per pattern: its
 own virtual nodes, wired once (the per-program cache, by hand), a Python
 loop over the steps per call, the leaves refilled with the private
 `_direct_set_tensor`, operands freed by hand. Programs give the same speed
 (§2.4) without the plan class: `contract(pattern)` keeps the construction
-(copies, inputs, path), and replay, freeing and the program per pattern come
-from tk. Its `contract` takes the observed *values* (`observed`: variable
-→ tensor), which as a program key would make a new program per batch: the
-port needs the pattern as the argument and the values as inputs, i.e. §3.7.
+(copies, inputs, path), and replay, freeing, per-pattern inputs and the
+program per pattern come from tk. §5 is this design on a chain.
+
+Programs make each pattern cheap to *call*; what a pattern computes is up
+to `contract`. Sharing work across patterns (all prefix marginals in one
+sweep, §3.3; conditionals from cached environments) belongs in a deep
+contraction method that returns several outputs from one program.
 
 
 ## 4. Implementation
@@ -400,28 +432,33 @@ port needs the pattern as the argument and the values as inputs, i.e. §3.7.
 
 | what | where |
 |---|---|
-| `Program` | end of the module: `_clear`, `__call__` (data, record or replay), `_record` (runs `fn`, checks outputs, marks them not erasable, resolves the steps), `_eager_state` |
-| network state | `TensorNetwork.__init__`: `_eager`, `_program`, `_programs` (key → Program), `_max_programs`, `_generation`, `_last_program` |
-| properties to the program being called | `_seq_ops`, `_inverse_memory`, `_tracing` (= the program is recording), `_traced` |
-| `max_programs`, `_full` | after `resultant_nodes` |
-| `program`, `_contract_key`, `_hashable_arg` | after `trace`; `_hashable_arg` is a module function |
-| `forward`, `trace`, `reset` | `forward` = `self.program(*args, **kwargs)(data)`; `trace` resets if full, calls the network, marks `_last_program` traced; `reset` empties `_programs`, increases `_generation`, clears `_eager` and every node's `_successor_caches` |
+| `Program` | end of the module: `_clear`, `__call__` (where the data goes; record, fill inputs, replay), `_fill_inputs`, `_record` (runs `fn`, checks outputs, marks them not erasable, resolves the steps), `_eager_state` |
+| network state | `TensorNetwork.__init__`: `_eager`, `_program`, `_programs` (key → Program), `_max_programs`, `_free_intermediates`, `_generation` |
+| properties to the program being called | `_seq_ops`, `_inverse_memory`, `_tracing` (= the program is recording), `_traced` (= `free_intermediates`, not while recording) |
+| `max_programs`, `free_intermediates`, `_full` | after `resultant_nodes` |
+| `_program_for`, `_contract_key`, `_hashable_arg` | after `trace`; `_hashable_arg` is a module function |
+| `input_node`, `_takes_data_nodes` | before `_add_data_or_set_nodes` |
+| `forward`, `trace`, `reset` | `forward` = `self._program_for(*args, **kwargs)(data)`; `trace` resets if full, calls the network, sets `free_intermediates`; `reset` empties `_programs`, increases `_generation`, clears `_eager` and every node's `_successor_caches` |
 | successors | `AbstractNode._successors` (property): `_successor_caches[network._program]` |
 | inverse memory | `_record_in_inverse_memory`, `_check_inverse_memory`: keyed by `node.node_ref()`; `_update_node_info` no longer moves keys |
+| an operand's parameter as a result | `_create_resultant_from_axes` (`operations.py`) turns it into a view |
 
 ### 4.2 Call flow
 
 ```
-forward(data, *args) -> program = net.program(*args)
+forward(data, *args) -> program = net._program_for(*args)
   _contract_key: bind to contract's signature, defaults, hashable
   found -> program; not found -> reset if full (warning), new Program
 program(data)
-  data: set_data_nodes if none, add_data
+  data: to the data nodes (set_data_nodes if none, add_data) if the network
+        takes data nodes; otherwise kept for the program's input nodes
   net._program = program (operations now use its cache and state)
-  recorded since the last reset?
-    no  -> _record: _recording = True; outputs = fn(); checks;
-           outputs not erasable; steps = [(fn_next, check_first(*args), args)]
-    yes -> for fn_next, successor, args in steps: fn_next(successor, *args)
+  not recorded since the last reset -> _record:
+        _recording = True; outputs = fn() (input_node: placeholders);
+        checks; outputs not erasable;
+        steps = [(fn_next, check_first(*args), args)]
+  input data -> _fill_inputs
+  recorded before, or inputs filled -> for each step: fn_next(successor, *args)
   net._program = net._eager
   return the outputs' tensors
 ```
@@ -434,15 +471,19 @@ and neither record nor check the inverse memory.
 
 - `forward` returns the tensor of the node `contract` returned, also in the
   replay (before: the last operation's output, which had to be that node).
-- Untraced recordings record the inverse memory too (no effect until
-  `trace`).
+- Every recording counts reads in the inverse memory (no effect until
+  `free_intermediates`).
+- Freeing is a setting of the network (`free_intermediates`), set by
+  `trace` and kept by `reset` (before: `reset` untraced the network).
 - Eager operations no longer share successors with `forward`'s program, so
   an eager call does not consume or free the program's tensors; and
   `forward` after eager operations records without a warning (before: it
   found resultant nodes, warned and reset).
 - `trace` resets only when the network is full (with the default, always).
+- Fix: `conj` of a real parameter returns the parameter itself, and the
+  resultant node detached it, so its first call had no gradient.
 - Two tests read the removed private attributes `_contract_outputs` and
-  `net._traced`; they read `net._programs` and `net.program()._traced` now.
+  `net._traced`; they read `net._programs` and `net.free_intermediates`.
 
 ### 4.4 Tests
 
@@ -455,11 +496,169 @@ and neither record nor check the inverse memory.
 - `max_programs`: same arguments (normalised) give the same program, the
   `n+1`-th resets with the warning, lowering it resets, type and value
   errors;
-- two traced programs each free their intermediates and the data;
-- a traced program survives a rename of its nodes;
-- `Program(net, fn)`: replays without calling `fn`, with inputs set by
-  `node.tensor = t` and another batch size, records again after `reset`;
-  errors; a failed recording is recorded again.
+- two programs each free their intermediates and the data;
+  `free_intermediates` holds for recorded programs, is kept by `reset` and
+  set by `trace`;
+- a freeing program survives a rename of its nodes;
+- §5's `Chain`, three programs with input nodes (Z, the likelihood, a
+  marginal), float64 and complex128, freeing on and off: the mixed loss and
+  its gradients equal a dense contraction;
+- input-node errors; `Program(net, fn)`: replays without calling `fn`, with
+  inputs set by `node.tensor = t` and another batch size, records again
+  after `reset`; errors; a failed recording is recorded again.
+
+`tests/test_operations.py::test_conj_real_param_grad`: the `conj` fix.
 
 With the per-program caches disabled (one shared cache), the alternation
 and the freeing tests fail.
+
+
+## 5. A larger example: the interface of tpm-tn-benchmark
+
+The contraction interface of tpm-tn-benchmark's `TreeNetwork`:
+`contract(other=None, observed=..., open=(), keep_off_diagonal=False)`.
+Each variable is observed (contracted with its data), open (left as an
+output leg) or summed; `other=None` contracts one layer, `other=net` two
+(the bra conjugated), where a summed variable is summed between the
+layers, and `other=self` with everything summed is $Z = \langle\psi|\psi\rangle$.
+Here on a chain, with `other=self` only and no open variables, and with
+every site's contraction rescaled (log-scales returned and summed in log
+space), so that no product of many factors overflows.
+
+The pattern (`other`, `observed`) is the program's key; the values are its
+data. `forward` turns the batch `x` (all variables) into one input per
+observed variable, $\varphi(x_i)\varphi(x_i)^\dagger$ (one-hot $\varphi$),
+in the order of `observed`. The loss mixes the likelihood and the marginal
+likelihood of the even variables, three programs per step:
+
+$$
+L = -\frac{1}{B}\sum_b \Big[\alpha \ln p(x^b) + (1-\alpha) \ln p(x^b_S)\Big],
+\qquad p(x_S) = \frac{P(x_S)}{Z}.
+$$
+
+```python
+import torch
+import tensorkrowch as tk
+
+
+class Chain(tk.TensorNetwork):
+    """psi(x) = A_0[x_0] ... A_{n-1}[x_{n-1}], with the contraction interface
+    of tpm-tn-benchmark: each variable is observed, summed or (not here) open.
+
+    contract(other, observed): one layer (other=None) or two (other=self,
+    the bra conjugated); `observed` is a tuple of variables, whose values
+    forward takes in `x`; every other variable is summed. Every site's
+    contraction is rescaled, so the result is (value, log-scales) and no
+    product of many factors overflows.
+    """
+
+    def __init__(self, n, d, r, dtype=torch.float64):
+        super().__init__(name='chain')
+        self.d = d
+        dims = [1] + [r] * (n - 1) + [1]
+        self.cores = [tk.randn(shape=(dims[i], d, dims[i + 1]),
+                               axes_names=('left', 'input', 'right'),
+                               name='core', network=self, param_node=True,
+                               std=0.5, dtype=dtype)
+                      for i in range(n)]
+        for a, b in zip(self.cores[:-1], self.cores[1:]):
+            a['right'] ^ b['left']
+
+    def _layer(self, name):
+        """Copies of the cores sharing their memory, wired along the chain."""
+        copies = []
+        for core in self.cores:
+            copy = tk.ParamNode(shape=core.shape, axes_names=core.axes_names,
+                                name='virtual_result_' + name,
+                                network=self, virtual=True)
+            copy.set_tensor_from(core)
+            copies.append(copy)
+        for a, b in zip(copies[:-1], copies[1:]):
+            a['right'] ^ b['left']
+        return copies
+
+    def contract(self, other=None, observed=()):
+        if other is not self:
+            raise ValueError('this example has only other=self')
+        ket, bra = self._layer('ket'), self._layer('bra')
+        logs = []
+        env = None
+        for i, (k, b) in enumerate(zip(ket, bra)):
+            if i in observed:   # phi(x_i) phi(x_i)^dagger, an input per call
+                rho = self.input_node(shape=(1, self.d, self.d),
+                                      axes_names=('batch', 'ket', 'bra'))
+                rho['ket'] ^ k['input']
+                rho['bra'] ^ b['input']
+            else:               # summed: <ket| and |bra> share the variable
+                k['input'] ^ b['input']
+            half = k if env is None else env @ k
+            if i in observed:
+                half = half @ rho
+            env, log = half.contract_between(b.conj(), rescale=True)
+            logs.append(log)
+        return (env, *logs)
+
+    def forward(self, x=None, other=None, observed=()):
+        """x: (batch, n) values; the observed ones are used."""
+        data = None
+        if observed:
+            phi = torch.nn.functional.one_hot(x, self.d).to(
+                self.cores[0].tensor.dtype)
+            data = [torch.einsum('bi,bj->bij', phi[:, i], phi[:, i].conj())
+                    for i in observed]
+        return super().forward(data, other=other, observed=tuple(observed))
+
+    def log_value(self, x=None, other=None, observed=()):
+        """log |contraction|: the rescaled value's log plus the log-scales."""
+        value, *logs = self(x, other=other, observed=observed)
+        return value.abs().log().reshape(-1) + sum(logs)
+
+
+torch.manual_seed(0)
+n, d, r = 20, 3, 8
+net = Chain(n, d, r)
+net.max_programs = None           # three programs
+net.free_intermediates = True     # optional: memory, not speed
+optimizer = torch.optim.Adam(net.parameters(), lr=1e-2)
+
+S = tuple(range(0, n, 2))         # the even variables
+alpha = 0.7                       # weight of the full likelihood
+x = torch.randint(d, (64, n))
+for step in range(100):
+    optimizer.zero_grad()
+    log_Z = net.log_value(other=net)                                 # 1
+    log_p = net.log_value(x, other=net, observed=range(n)) - log_Z   # 2
+    log_p_S = net.log_value(x, other=net, observed=S) - log_Z        # 3
+    loss = -(alpha * log_p + (1 - alpha) * log_p_S).mean()
+    loss.backward()
+    optimizer.step()
+print(f'{loss.item():.3f}', len(net._programs))
+```
+
+Output: `14.115 3` (the loss after 100 steps, from 21.09 at the first;
+three programs). The values and gradients equal a dense contraction, in
+float64 and complex128 (`tests/test_components.py::TestProgram`, which has
+this `Chain`).
+
+What each piece does:
+
+- `_layer` makes copies of the cores that share their memory
+  (`set_tensor_from`): each pattern wires its own copies, since a leg can
+  be connected to one other leg only.
+- `contract` zips the two layers from the left. At site `i`, the ket copy,
+  then (if observed) the input $\varphi\varphi^\dagger$, then the
+  conjugated bra copy are absorbed into the environment; the last step is
+  `contract_between(..., rescale=True)`, which divides the environment by
+  its largest entry per sample and returns that scale's log. The program's
+  outputs are the environment and the `n` log-scales.
+- `log_value` adds the log of the rescaled value to the log-scales.
+- In the loop, `net.log_value(other=net)` has no inputs (it is $\ln Z$,
+  without batch); the two others have one input per observed variable.
+
+Variants that fit the same scheme: `open` variables (leave their legs
+dangling, and return them as outputs: a marginal over them); `other` a
+different network (needs its cores in the same tensorkrowch network, or
+copies of them, since nodes of two networks cannot be connected); a
+dictionary for `observed` (turn it into a tuple of variables for the key
+and a list of values for the data in `forward`); conditionals
+$p(x_I \mid x_J) = P(x_{I\cup J})/P(x_J)$, two programs.

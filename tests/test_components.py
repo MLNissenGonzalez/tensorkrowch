@@ -3680,7 +3680,7 @@ class TestProgram:  # MARK: TestProgram
         assert len(net._programs) == 2
         
         # Same arguments, normalised: no new program
-        assert net.program(from_left=True) is net.program(True, 1.)
+        assert net._program_for(from_left=True) is net._program_for(True, 1.)
         assert len(net._programs) == 2
         
         # The network is reset when one more program is recorded
@@ -3722,8 +3722,8 @@ class TestProgram:  # MARK: TestProgram
             assert torch.allclose(result, net.dense(data))
             
             # Intermediate tensors of the program are erased
-            program = net.program(from_left)
-            assert program._traced
+            program = net._program_for(from_left)
+            assert net.free_intermediates
             for _, successor, _ in program._steps:
                 if successor.child is not program._outputs[0]:
                     assert successor.child.tensor is None
@@ -3834,3 +3834,180 @@ class TestProgram:  # MARK: TestProgram
         for _ in range(2):
             assert torch.allclose(program(), 3 * node.tensor)
         assert len(calls) == 2
+
+
+    class Chain(tk.TensorNetwork):
+        """psi(x) = A_0[x_0] ... A_{n-1}[x_{n-1}], with the contraction interface
+        of tpm-tn-benchmark: each variable is observed, summed or (not here) open.
+
+        contract(other, observed): one layer (other=None) or two (other=self,
+        the bra conjugated); `observed` is a tuple of variables, whose values
+        forward takes in `x`; every other variable is summed. Every site's
+        contraction is rescaled, so the result is (value, log-scales) and no
+        product of many factors overflows.
+        """
+
+        def __init__(self, n, d, r, dtype=torch.float64):
+            super().__init__(name='chain')
+            self.d = d
+            dims = [1] + [r] * (n - 1) + [1]
+            self.cores = [tk.randn(shape=(dims[i], d, dims[i + 1]),
+                                   axes_names=('left', 'input', 'right'),
+                                   name='core', network=self, param_node=True,
+                                   std=0.5, dtype=dtype)
+                          for i in range(n)]
+            for a, b in zip(self.cores[:-1], self.cores[1:]):
+                a['right'] ^ b['left']
+
+        def _layer(self, name):
+            """Copies of the cores sharing their memory, wired along the chain."""
+            copies = []
+            for core in self.cores:
+                copy = tk.ParamNode(shape=core.shape, axes_names=core.axes_names,
+                                    name='virtual_result_' + name,
+                                    network=self, virtual=True)
+                copy.set_tensor_from(core)
+                copies.append(copy)
+            for a, b in zip(copies[:-1], copies[1:]):
+                a['right'] ^ b['left']
+            return copies
+
+        def contract(self, other=None, observed=()):
+            if other is not self:
+                raise ValueError('this example has only other=self')
+            ket, bra = self._layer('ket'), self._layer('bra')
+            logs = []
+            env = None
+            for i, (k, b) in enumerate(zip(ket, bra)):
+                if i in observed:   # phi(x_i) phi(x_i)^dagger, an input per call
+                    rho = self.input_node(shape=(1, self.d, self.d),
+                                          axes_names=('batch', 'ket', 'bra'))
+                    rho['ket'] ^ k['input']
+                    rho['bra'] ^ b['input']
+                else:               # summed: <ket| and |bra> share the variable
+                    k['input'] ^ b['input']
+                half = k if env is None else env @ k
+                if i in observed:
+                    half = half @ rho
+                env, log = half.contract_between(b.conj(), rescale=True)
+                logs.append(log)
+            return (env, *logs)
+
+        def forward(self, x=None, other=None, observed=()):
+            """x: (batch, n) values; the observed ones are used."""
+            data = None
+            if observed:
+                phi = torch.nn.functional.one_hot(x, self.d).to(
+                    self.cores[0].tensor.dtype)
+                data = [torch.einsum('bi,bj->bij', phi[:, i], phi[:, i].conj())
+                        for i in observed]
+            return super().forward(data, other=other, observed=tuple(observed))
+
+        def log_value(self, x=None, other=None, observed=()):
+            """log |contraction|: the rescaled value's log plus the log-scales."""
+            value, *logs = self(x, other=other, observed=observed)
+            return value.abs().log().reshape(-1) + sum(logs)
+    
+    @staticmethod
+    def dense_chain(net, x, observed):
+        """log Z, and log P(x_observed) (the rest summed), from psi."""
+        n = len(net.cores)
+        psi = net.cores[0].tensor[0]
+        for core in net.cores[1:]:
+            psi = torch.einsum('...l,lir->...ir', psi, core.tensor)
+        P = psi[..., 0].abs() ** 2
+        summed = tuple(i for i in range(n) if i not in observed)
+        P_observed = P.sum(dim=summed) if summed else P
+        return P.sum().log(), \
+            P_observed[tuple(x[:, i] for i in observed)].log()
+    
+    @pytest.mark.parametrize('dtype', [torch.float64, torch.complex128])
+    @pytest.mark.parametrize('free', [False, True])
+    def test_input_nodes_patterns(self, dtype, free):
+        n, d = 6, 3
+        net = self.Chain(n, d, 4, dtype)
+        net.max_programs = None
+        net.free_intermediates = free
+        x = torch.randint(d, (5, n))
+        subset = (0, 2, 3)
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            for _ in range(3):
+                log_Z = net.log_value(other=net)
+                log_p = net.log_value(x, other=net, observed=range(n)) - log_Z
+                log_p_S = net.log_value(x, other=net, observed=subset) - log_Z
+                loss = -(0.7 * log_p + 0.3 * log_p_S).mean()
+                
+                dense_Z, dense_x = self.dense_chain(net, x, tuple(range(n)))
+                _, dense_S = self.dense_chain(net, x, subset)
+                expected = -(0.7 * (dense_x - dense_Z) +
+                             0.3 * (dense_S - dense_Z)).mean()
+                assert torch.allclose(loss, expected)
+                
+                params = [core.tensor for core in net.cores]
+                grads = torch.autograd.grad(loss, params)
+                expected_grads = torch.autograd.grad(expected, params)
+                for grad, expected_grad in zip(grads, expected_grads):
+                    assert torch.allclose(grad, expected_grad)
+        
+        assert len(net._programs) == 3
+        program = net._program_for(other=net, observed=subset)
+        assert len(program._inputs) == len(subset)
+        # Inputs hold the last call's data
+        assert program._inputs[0].shape == (5, d, d)
+    
+    def test_input_node_errors(self):
+        net = self.Chain(3, 2, 2)
+        with pytest.raises(ValueError):
+            net.input_node(shape=(1, 2), axes_names=('batch', 'feature'))
+        
+        # Data with one tensor per input node
+        with pytest.raises(ValueError):
+            tk.TensorNetwork.forward(net, [torch.ones(4, 2, 2)],
+                                     other=net, observed=(0, 1))
+        
+        # Data nodes and input nodes cannot be combined
+        class Both(self.Chain):
+            def set_data_nodes(self):
+                tk.TensorNetwork.set_data_nodes(
+                    self, [self.cores[0]['input']], num_batch_edges=1)
+        both = Both(3, 2, 2)
+        with pytest.raises(ValueError), warnings.catch_warnings():
+            warnings.simplefilter('ignore')  # data cropped into the data node
+            both(torch.zeros(4, 3, dtype=torch.long), other=both,
+                 observed=(1,))
+        
+        # Data, but neither data nodes nor input nodes
+        net = tk.TensorNetwork()
+        node = tk.randn(shape=(3,), network=net)
+        program = tk.Program(net, lambda: node * 2.)
+        with pytest.raises(TypeError):
+            program([torch.ones(3)])
+    
+    def test_free_intermediates(self):
+        net = self.ChainTN(torch.float64)
+        assert net.free_intermediates is False
+        with pytest.raises(TypeError):
+            net.free_intermediates = 1
+        
+        data = torch.randn(5, 3, 3, dtype=torch.float64)
+        net(data)
+        assert any(node.tensor is not None
+                   for node in net.resultant_nodes.values()
+                   if node is not net._program_for()._outputs[0])
+        
+        # On for every program, also recorded already
+        net.free_intermediates = True
+        net(data)
+        program = net._program_for()
+        for _, successor, _ in program._steps:
+            if successor.child is not program._outputs[0]:
+                assert successor.child.tensor is None
+        
+        # Kept by reset; trace sets it
+        net.reset()
+        assert net.free_intermediates
+        net.free_intermediates = False
+        net.trace(torch.zeros(1, 3, 3, dtype=torch.float64))
+        assert net.free_intermediates
