@@ -315,3 +315,27 @@ are in `docs/programs.md`.
   tensor argument where a program had another raises `ValueError`; `_freeing`
   is a plain attribute set around replays (eager `a @ b` +0.3 µs over
   `contraction-primitives`).
+
+## Since: issue #6, `free_intermediates` leaves nothing (2026-10-31)
+
+- With `free_intermediates`, a program now erases, when each call returns
+  (the recording call too), every tensor of its own that is left: outputs,
+  input nodes, and results that nothing reads (`Program._free`). Before,
+  outputs and inputs stayed until the next call, so a dropped result kept
+  its autograd graph, one graph per program; and a program without inputs
+  freed nothing on the call that recorded it (only a replay frees).
+  Measured downstream (tpm-tn-benchmark's `TreeNetwork`, n = 43, d = 23,
+  r = 16, batch 256, CPU): 30 marginals with gradients, results dropped,
+  held 83 MB, and 0 now.
+- One rule, `_erasable` (resultant and data nodes, `stack_data_memory`),
+  shared with the inverse memory. Memory that a non-erasable node reads is
+  kept: with `auto_stack`, stacked plain leaf nodes read theirs from the
+  stack, which is a resultant node. The list of nodes to erase is made once
+  per recording (`_find_steps`).
+- Output nodes hold `None` after a call with the setting on; `trace` turns
+  it on. Nothing in the library read them; two tests did
+  (`test_to_contracted`, MPS and UMPS), which now contract without it.
+- `copy.deepcopy` after a call with gradients works again with the setting
+  on. Separately, deep-copying a network with many nodes (a 43-site tree
+  network after one pattern) exceeds Python's default recursion limit
+  (1000), with or without the setting.

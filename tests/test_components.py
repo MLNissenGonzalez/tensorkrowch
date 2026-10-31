@@ -23,6 +23,7 @@ This script contains tests for components:
 import copy
 import io
 import warnings
+import weakref
 
 import pytest
 
@@ -3961,6 +3962,184 @@ class TestProgram:  # MARK: TestProgram
         net.trace(torch.zeros(1, 3, 3, dtype=torch.float64))
         assert net.free_intermediates
     
+    @staticmethod
+    def held_by_programs(net):
+        """Names of the nodes holding a tensor of their own that is not a
+        parameter's: what the network's programs keep after a call."""
+        return [node.name for node in net.nodes.values()
+                if node.tensor is not None
+                and not node.node_ref().is_leaf()
+                and not isinstance(node.node_ref(), tk.ParamStackNode)]
+
+    @pytest.mark.parametrize('grad', [False, True])
+    @pytest.mark.parametrize('observed', [(), (0, 2)], ids=['no_inputs',
+                                                           'inputs'])
+    def test_free_intermediates_leaves_nothing(self, observed, grad):
+        x = torch.randint(2, (5, 4))
+        net = self.Chain(4, 2, 3)
+        net.max_programs = None
+        net.free_intermediates = True
+        with torch.set_grad_enabled(grad):
+            for _ in range(3):  # the recording call, then replays
+                net(x, other=net, observed=observed)
+                assert self.held_by_programs(net) == []
+
+        # With the setting off, the program keeps its outputs and inputs (and,
+        # after recording a program without inputs, every intermediate)
+        net = self.Chain(4, 2, 3)
+        with torch.set_grad_enabled(grad):
+            net(x, other=net, observed=observed)
+        assert self.held_by_programs(net) != []
+
+    def test_free_intermediates_with_data_nodes(self):
+        net = self.ChainTN(torch.float64)
+        net.free_intermediates = True
+        for _ in range(3):
+            data = torch.randn(5, 3, 3, dtype=torch.float64)
+            assert torch.allclose(net(data), net.dense(data))
+            assert self.held_by_programs(net) == []
+
+    def test_free_intermediates_unread_result(self):
+        """A result that no operation reads and the program does not return
+        (here the log-scale of a rescaled contraction) is freed too."""
+        net = tk.TensorNetwork()
+        nodeA = tk.randn(shape=(2, 3), axes_names=('left', 'right'),
+                         network=net, dtype=torch.float64)
+        nodeB = tk.randn(shape=(3, 4), axes_names=('left', 'right'),
+                         network=net, dtype=torch.float64)
+        nodeA['right'] ^ nodeB['left']
+        net.free_intermediates = True
+        program = tk.Program(net, lambda: nodeA.contract_between(
+            nodeB, rescale=True)[0])
+        for _ in range(2):
+            result = program()
+            expected = nodeA.tensor @ nodeB.tensor
+            assert torch.allclose(result, expected / expected.abs().max())
+            assert self.held_by_programs(net) == []
+
+    def test_free_intermediates_keeps_parameters(self):
+        """Outputs that are parameters, or copies reading them, keep them."""
+        net = tk.TensorNetwork()
+        nodeA = tk.randn(shape=(2, 3), axes_names=('left', 'right'),
+                         network=net, param_node=True, dtype=torch.float64)
+        nodeB = tk.randn(shape=(3, 4), axes_names=('left', 'right'),
+                         network=net, param_node=True, dtype=torch.float64)
+        nodeA['right'] ^ nodeB['left']
+        net.free_intermediates = True
+        program = tk.Program(net, lambda: (nodeA @ nodeB, nodeA,
+                                           net.copy_node(nodeB)))
+        for _ in range(2):
+            product, a, b = program()
+            assert torch.allclose(product, nodeA.tensor @ nodeB.tensor)
+            assert a is nodeA.tensor and torch.equal(b, nodeB.tensor)
+            assert isinstance(nodeA.tensor, nn.Parameter)
+            assert len(list(net.parameters())) == 2
+            assert self.held_by_programs(net) == []
+    
+    @pytest.mark.parametrize('param_node', [False, True])
+    def test_free_intermediates_keeps_stacked_leaves(self, param_node):
+        """With ``auto_stack``, stacked leaf nodes read their tensors from the
+        stack, a resultant node (or a ParamStackNode), which is kept."""
+        net = tk.TensorNetwork()
+        net.auto_stack = True
+        net.free_intermediates = True
+        nodes = [tk.randn(shape=(2, 5, 2),
+                          axes_names=('left', 'input', 'right'),
+                          name='node', network=net, param_node=param_node,
+                          dtype=torch.float64)
+                 for _ in range(3)]
+        for left, right in zip(nodes[:-1], nodes[1:]):
+            left['right'] ^ right['left']
+        net.set_data_nodes([node['input'] for node in nodes], 1)
+        
+        def fn():
+            stack_nodes = tk.stack(nodes)
+            stack_data = tk.stack(list(net.data_nodes.values()))
+            stack_nodes['input'] ^ stack_data['feature']
+            aux = tk.unbind(stack_nodes @ stack_data)
+            return (aux[0] @ aux[1]) @ aux[2]
+        
+        program = tk.Program(net, fn)
+        for _ in range(3):  # the recording call, then replays
+            data = torch.randn(4, 3, 5, dtype=torch.float64)
+            result = program(data)
+            expected = torch.einsum('zi,aib,zj,bjc,zk,ckd->zad',
+                                    data[:, 0], nodes[0].tensor,
+                                    data[:, 1], nodes[1].tensor,
+                                    data[:, 2], nodes[2].tensor)
+            assert torch.allclose(result, expected)
+            for node in net.data_nodes.values():
+                assert node.tensor is None
+    
+    @pytest.mark.parametrize('observed', [(), (0, 2)], ids=['no_inputs',
+                                                           'inputs'])
+    def test_dropped_result_holds_no_graph(self, observed):
+        x = torch.randint(2, (5, 4))
+        for free in [True, False]:
+            net = self.Chain(4, 2, 3)
+            net.max_programs = None
+            net.free_intermediates = free
+            for _ in range(2):  # the recording call, then a replay
+                result = net(x, other=net, observed=observed)[0]
+                assert result.requires_grad
+                ref = weakref.ref(result)
+                del result
+                # With the setting off, the output node keeps the tensor (and
+                # its graph) until the program's next call
+                assert (ref() is None) == free
+
+    @pytest.mark.parametrize('dtype', [torch.float64, torch.complex128])
+    def test_free_intermediates_same_values(self, dtype):
+        """Values and gradients equal those with the setting off: also with
+        another batch size, after reset, and after torch.save/load."""
+        nets = [self.Chain(5, 3, 4, dtype)]
+        nets.append(copy.deepcopy(nets[0]))
+        for net, free in zip(nets, [False, True]):
+            net.max_programs = None
+            net.free_intermediates = free
+
+        def loss_and_grads(net, x):
+            log_Z = net.log_value(other=net)
+            log_p = net.log_value(x, other=net, observed=(0, 2, 3)) - log_Z
+            loss = -log_p.mean()
+            params = [core.tensor for core in net.cores]
+            return loss, torch.autograd.grad(loss, params)
+
+        def check(nets, batch):
+            x = torch.randint(3, (batch, 5))
+            (loss_off, grads_off), (loss_on, grads_on) = \
+                [loss_and_grads(net, x) for net in nets]
+            assert torch.equal(loss_on, loss_off)
+            for on, off in zip(grads_on, grads_off):
+                assert torch.equal(on, off)
+
+        for batch in [5, 5, 7]:  # recording, replay, another batch size
+            check(nets, batch)
+        for net in nets:
+            net.reset()
+        check(nets, 6)
+
+        loaded = []
+        for net in nets:
+            buffer = io.BytesIO()
+            torch.save(net, buffer)
+            buffer.seek(0)
+            loaded.append(torch.load(buffer, weights_only=False))
+        assert loaded[1].free_intermediates
+        for batch in [5, 4]:
+            check(loaded, batch)
+
+    def test_deepcopy_after_call_with_gradients(self):
+        net = self.Chain(4, 2, 3)
+        net.max_programs = None
+        net.free_intermediates = True
+        x = torch.randint(2, (5, 4))
+        value = net.log_value(x, other=net, observed=(1,))
+        assert value.requires_grad
+        copied = copy.deepcopy(net)
+        assert torch.allclose(
+            copied.log_value(x, other=copied, observed=(1,)), value)
+
     def test_copy_node(self):
         net = self.ChainTN(torch.float64)
         param = net.params[1]
