@@ -51,6 +51,10 @@ hints. `fn_next` only does tensor arithmetic.
   `_seq_ops`. It is needed only when the structure of the contraction changes;
   `forward` also resets when the arguments of `contract` change.
 
+(Since issue #2, each set of `contract` arguments has its own recording, a
+`Program`, and a network can keep several: see `docs/programs.md`. The
+description above is the one-program case, the default.)
+
 ### The consequence
 
 Only computations made **inside operations** survive the replay. This
@@ -552,6 +556,9 @@ public functions turn lists of axes into tuples.
   returns their tensors; otherwise it returns the last operation's output, as
   before.
 - `reset` sets `_contract_outputs = None`.
+
+(Since issue #2 the outputs are kept by the `Program` of the call, which
+returns their tensors in the replay too: `docs/programs.md` §4.)
 
 ### 4.4 `_create_resultant_from_axes`
 

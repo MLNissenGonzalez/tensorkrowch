@@ -64,3 +64,9 @@ Tensor Network
 
 .. autoclass:: TensorNetwork
     :members:
+Program
+-------
+
+.. autoclass:: Program
+    :members:
+    :special-members: __call__

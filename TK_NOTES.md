@@ -267,3 +267,51 @@ variables) needed around tensorkrowch, items 1 and 2. Variants and measurements 
 - `contract_between(..., rescale=True)` contracts nodes that share nothing
   as an outer product, as a contraction path's step may; without `rescale`
   it still raises.
+
+## Since: `recorded-programs` (issue #2, 2026-10-28/30)
+
+Several recorded contractions per network. Recipe, design and implementation
+are in `docs/programs.md`.
+
+- `forward(data, *args)` keeps one `Program` per set of normalised `contract`
+  arguments and replays it from its second call (`fn_next` with the successors
+  found once, no `check_first`). `tk.Program(net, fn)` records any other
+  function. The lookup by arguments is private (`_program_for`).
+- `max_programs` (default 1: a new set of arguments warns and resets, as
+  before; `None` keeps all until `reset`). Programs are freed only together:
+  evicting one would delete some nodes (name collisions or renames) and the
+  `ParamStackNode` that `auto_stack` shares between programs.
+- Each program has its own successor cache (`node._successor_caches`), so
+  two contractions starting with the same operation on the same nodes no
+  longer share (and lose) a step; and its own `_seq_ops` and inverse memory.
+  The operations reach them through properties of the network, unchanged.
+- Inputs: data nodes (one set per network), or input nodes that `contract`
+  creates (`net.input_node(shape, axes_names)`), one set per program, for a
+  different observed set per pattern. Input nodes are placeholders (zeros,
+  batch 1): the first call records on them, fills them and replays.
+- `free_intermediates`: one switch for every program (set by `trace`, kept by
+  `reset`). Memory, not time: 64 MB → 0 held after a no-grad call (n=100,
+  r=64, batch 256), same 27 ms.
+- Speed: replay is as fast as per-pattern nodes re-run through the lookups
+  (1.39 vs 1.42 ms); the gain is against resetting per switch (9.1 → 3.3 ms
+  per training step with two contractions).
+- Fixes on the way: the inverse memory is keyed by the node storing the
+  memory, not its name, so freeing survives a rename of nodes (`x` → `x_0`),
+  which raised `KeyError`; eager operations no longer hit (and count against)
+  a program's cache; `conj` of a real parameter lost its gradient on the first
+  call (the resultant node detached the parameter that `conj` returned).
+- `MPS.sample` keeps `_sample_kernel`: its steps can be programs, but not in
+  fewer lines, for about 13 of 70 µs per step.
+- After the review of #4: `copy_node(node)` (a program's copy sharing a
+  node's tensor, new edges, deleted by `reset`) replaces hand-made
+  `virtual_result_*` copies; a program with input nodes called without data
+  raises; the internal flags are
+  `_recording` and `_freeing` (were `_tracing`, `_traced`). The notes above
+  that name `_tracing`/`_traced` describe the code before this branch.
+- Second round: references (`set_tensor_from`, `copy_node`) follow a node
+  whose memory moves into a stack later (it raised `KeyError` in replays, and
+  `tensor_address()` was `None`); restored networks keep their programs
+  (`Program.__getstate__` drops only `_steps`, found again); a new
+  tensor argument where a program had another raises `ValueError`; `_freeing`
+  is a plain attribute set around replays (eager `a @ b` +0.3 µs over
+  `contraction-primitives`).

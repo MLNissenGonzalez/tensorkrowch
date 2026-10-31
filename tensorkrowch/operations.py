@@ -140,6 +140,10 @@ def _create_resultant_from_axes(axes: Sequence[Union[Axis, Text]],
         raise ValueError(
             f'Tensor with {tensor.dim()} dimensions cannot be the tensor of a '
             f'node with {len(axes)} axes')
+    if isinstance(tensor, Parameter):
+        # A kernel can return an operand's parameter itself (``conj`` of a
+        # real tensor), which a Node would detach
+        tensor = tensor.view_as(tensor)
     
     axes_names = []
     for i, axis in enumerate(axes):
@@ -324,8 +328,8 @@ def _build_operation(name: Text,
         # Add operation to list of performed operations of TN
         net._seq_ops.append((name, args))
         
-        # Record in inverse_memory while tracing
-        if net._tracing:
+        # Record in inverse_memory while recording
+        if net._recording:
             for node in nodes:
                 node._record_in_inverse_memory()
         
@@ -351,9 +355,9 @@ def _build_operation(name: Text,
             for node, tensor in zip(child, tensors):
                 node._direct_set_tensor(tensor)
         
-        # Record in inverse_memory while contracting, if network is traced
+        # Check inverse_memory while replaying, if the program frees tensors
         # (to delete memory if possible)
-        if nodes[0]._network._traced:
+        if nodes[0]._network._freeing:
             for node, node_ref in zip(nodes, successor.node_ref):
                 node._check_inverse_memory(node_ref)
         
@@ -1543,8 +1547,8 @@ def _split_first(node: AbstractNode,
     # Add operation to list of performed operations of TN
     net._seq_ops.append(('split', args))
 
-    # Record in inverse_memory while tracing
-    if net._tracing:
+    # Record in inverse_memory while recording
+    if net._recording:
         node._record_in_inverse_memory()
 
     return node1, node2
@@ -1640,9 +1644,9 @@ def _split_next(successor: Successor,
     children[0]._direct_set_tensor(node1_tensor)
     children[1]._direct_set_tensor(node2_tensor)
 
-    # Record in inverse_memory while contracting, if network is traced
+    # Check inverse_memory while replaying, if the program frees tensors
     # (to delete memory if possible)
-    if node._network._traced:
+    if node._network._freeing:
         node._check_inverse_memory(successor.node_ref)
 
     return children[0], children[1]
@@ -4560,7 +4564,7 @@ def _merge_edges_first(edges: Sequence[Edge]) -> Union[Node, Tuple[Node, Node]]:
 
         net._seq_ops.append(('merge_edges', args))
 
-        if net._tracing:
+        if net._recording:
             node1._record_in_inverse_memory()
 
         return new_node, new_node
@@ -4625,7 +4629,7 @@ def _merge_edges_first(edges: Sequence[Edge]) -> Union[Node, Tuple[Node, Node]]:
 
         net._seq_ops.append(('merge_edges', args))
 
-        if net._tracing:
+        if net._recording:
             node1._record_in_inverse_memory()
 
         return new_node1
@@ -4706,7 +4710,7 @@ def _merge_edges_first(edges: Sequence[Edge]) -> Union[Node, Tuple[Node, Node]]:
 
     net._seq_ops.append(('merge_edges', args))
 
-    if net._tracing:
+    if net._recording:
         node1._record_in_inverse_memory()
         node2._record_in_inverse_memory()
 
@@ -4754,7 +4758,7 @@ def _merge_edges_next(successor: Successor,
         child = successor.child
         child._direct_set_tensor(new_tensor)
 
-        if node1._network._traced:
+        if node1._network._freeing:
             node1._check_inverse_memory(successor.node_ref)
 
         return child, child
@@ -4788,7 +4792,7 @@ def _merge_edges_next(successor: Successor,
         child = successor.child
         child._direct_set_tensor(new_tensor1)
 
-        if node1._network._traced:
+        if node1._network._freeing:
             node1._check_inverse_memory(successor.node_ref)
 
         return child
@@ -4816,7 +4820,7 @@ def _merge_edges_next(successor: Successor,
     children[0]._direct_set_tensor(new_tensor1)
     children[1]._direct_set_tensor(new_tensor2)
 
-    if node1._network._traced:
+    if node1._network._freeing:
         node1._check_inverse_memory(successor.node_ref[0])
         node2._check_inverse_memory(successor.node_ref[1])
 
@@ -5237,7 +5241,7 @@ def _split_edge_first(edge: Edge,
 
         net._seq_ops.append(('split_edge', args))
 
-        if net._tracing:
+        if net._recording:
             node1._record_in_inverse_memory()
 
         return new_node, new_node
@@ -5287,7 +5291,7 @@ def _split_edge_first(edge: Edge,
 
         net._seq_ops.append(('split_edge', args))
 
-        if net._tracing:
+        if net._recording:
             node1._record_in_inverse_memory()
 
         return new_node1
@@ -5353,7 +5357,7 @@ def _split_edge_first(edge: Edge,
 
     net._seq_ops.append(('split_edge', args))
 
-    if net._tracing:
+    if net._recording:
         node1._record_in_inverse_memory()
         node2._record_in_inverse_memory()
 
@@ -5381,7 +5385,7 @@ def _split_edge_next(successor: Successor,
         child = successor.child
         child._direct_set_tensor(tensor.reshape(new_shape))
 
-        if node1._network._traced:
+        if node1._network._freeing:
             node1._check_inverse_memory(successor.node_ref)
 
         return child, child
@@ -5406,7 +5410,7 @@ def _split_edge_next(successor: Successor,
         child = successor.child
         child._direct_set_tensor(tensor1.reshape(new_shape1))
 
-        if node1._network._traced:
+        if node1._network._freeing:
             node1._check_inverse_memory(successor.node_ref)
 
         return child
@@ -5425,7 +5429,7 @@ def _split_edge_next(successor: Successor,
     children[0]._direct_set_tensor(tensor1.reshape(new_shape1))
     children[1]._direct_set_tensor(tensor2.reshape(new_shape2))
 
-    if node1._network._traced:
+    if node1._network._freeing:
         node1._check_inverse_memory(successor.node_ref[0])
         node2._check_inverse_memory(successor.node_ref[1])
 
@@ -5974,8 +5978,8 @@ def _stack_first(nodes: Sequence[AbstractNode]) -> StackNode:
                 if all_param:
                     delattr(net, 'param_' + node._name)
 
-        # Record in inverse_memory while tracing
-        if net._tracing:
+        # Record in inverse_memory while recording
+        if net._recording:
             for node in nodes:
                 node._record_in_inverse_memory()
 
@@ -6029,9 +6033,9 @@ def _stack_next(successor: Successor,
     # stack_tensor = stack_unequal_tensors([node._direct_tensor for node in nodes])
     child._direct_set_tensor(stack_tensor)
 
-    # Record in inverse_memory while contracting, if network is traced
+    # Check inverse_memory while replaying, if the program frees tensors
     # (to delete memory if possible)
-    if nodes[0]._network._traced:
+    if nodes[0]._network._freeing:
         for node_ref, node in zip(successor.node_ref, nodes):
             node._check_inverse_memory(node_ref)
 
@@ -6158,8 +6162,8 @@ def _unbind_first(node: AbstractStackNode) -> List[Node]:
             lst_crops.append(tuple(index))
 
     if not net._auto_unbind:
-        # Record in inverse_memory while tracing
-        if net._tracing:
+        # Record in inverse_memory while recording
+        if net._recording:
             node._record_in_inverse_memory()
 
     else:  # index_mode
@@ -6261,9 +6265,9 @@ def _unbind_next(successor: Successor, node: AbstractStackNode) -> List[Node]:
             for tensor, child, crop in zip(tensors, children, hints['lst_crops']):
                 child._direct_set_tensor(tensor[crop])
 
-        # Record in inverse_memory while contracting, if network is traced
+        # Check inverse_memory while replaying, if the program frees tensors
         # (to delete memory if possible)
-        if net._traced:
+        if net._freeing:
             node._check_inverse_memory(successor.node_ref)
         return children[:]
 
@@ -6562,8 +6566,8 @@ def _einsum_first(string: Text, *nodes: AbstractNode) -> Node:
     net = nodes[0]._network
     net._seq_ops.append(('einsum', args))
 
-    # Record in inverse_memory while tracing
-    if net._tracing:
+    # Record in inverse_memory while recording
+    if net._recording:
         for node in nodes:
             node._record_in_inverse_memory()
 
@@ -6585,9 +6589,9 @@ def _einsum_next(successor: Successor,
     child = successor.child
     child._direct_set_tensor(new_tensor)
 
-    # Record in inverse_memory while contracting, if network is traced
+    # Check inverse_memory while replaying, if the program frees tensors
     # (to delete memory if possible)
-    if nodes[0]._network._traced:
+    if nodes[0]._network._freeing:
         for node_ref, node in zip(successor.node_ref, nodes):
             node._check_inverse_memory(node_ref)
 
