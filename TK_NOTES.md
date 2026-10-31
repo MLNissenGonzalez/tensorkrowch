@@ -78,6 +78,8 @@ the source or by a probe; guesses are marked as such.
   have one shape), so an extra data node breaks it: use virtual nodes for
   auxiliary inputs (bm4tc names them `virtual_result_sample_*`, so `reset` deletes
   them). `virtual_uniform` nodes (uniform MPS) are left alone by `reset`.
+  (`contraction-primitives`: data nodes created directly also coexist in
+  several sets; inputs per recorded contraction are issue #2.)
 - Setting a tensor: `node.tensor = t` for non-result nodes that own their tensor;
   `set_tensor_from(other)` makes a node read another node's memory (`node_ref`),
   which is how a bra layer can share the ket's tensors without copying.
@@ -87,7 +89,8 @@ the source or by a probe; guesses are marked as such.
   identity permutation is a cheap way to get a node of one's own to do edge
   surgery on.
 - `@` (`contract_between`) refuses two nodes whose only shared edges are batch
-  edges; `einsum` does that product.
+  edges; `einsum` does that product. (`contraction-primitives`: they contract, as
+  an outer product in the rest; see below.)
 - `einsum` needs repeated **non-batch** subscripts to be connected edges.
 - Duplicate axis names in one node are renamed `input_0`, `input_1`.
 - Axis renaming on a node: `node.get_axis(name).name = new`.
@@ -218,7 +221,49 @@ implementation):
   the univocal form is exact to 1e-12.
 
 Still open from the list above: the quadratic renaming in `reset` and
-`move_to_network`; `@` on batch-only edges; `einsum`'s connected-edge rule;
+`move_to_network`; `@` on batch-only edges (done on `contraction-primitives`);
+`einsum`'s connected-edge rule;
 edge inheritance through result nodes; `reset` reordering `parameters()`; the
 trace bookkeeping without the replay (private flags); float32 precision of
 double layers in `sample`.
+
+## Since: `contraction-primitives` (issue #1, 2026-10-28)
+
+What a general tree contraction (one or two layers; observed, open or summed
+variables) needed around tensorkrowch, items 1 and 2. Variants and measurements are in
+`docs/custom_operations.md` (§2.9 guide, §3 design, §4.6 implementation).
+
+- `contract_between(node1, node2, keep=None, rescale=False)` (and `@`,
+  `contract_edges`), on the operations core:
+  - `keep`: dangling axes that both nodes have are kept once, element-wise
+    along them. Batch axes with the same name are always kept, by the same `bmm`
+    batch dimension. Nodes sharing only batch or kept axes contract as an outer
+    product in the rest.
+  - `rescale=True`: the result is divided by its max |entry| per sample
+    (detached; 1 if zero), and `(result, log_scale)` is returned.
+  - The downstream `contract_rescale` (52 lines) becomes one call. Same values
+    and gradients at rtol 1e-12.
+- Rejected: a naming convention (dangling equal names kept), which breaks 710
+  existing tests (MPS/MPO sites all have `input` legs); copy (δ) nodes, which
+  need a neighbour lookup in the contraction, densify if the order touches δ,
+  and cannot express the batch or a variable shared by three or more factors;
+  a node-level einsum, which leaves the letter bookkeeping to the caller.
+- Per-call inputs (the issue's item 3) moved to issue #2, programs per set
+  of `contract` arguments with their own data nodes. Found here: data nodes
+  created directly coexist in several sets, set with `node.tensor = t` (about
+  3.7 µs against 0.2 µs for `_direct_set_tensor`) and freed by a traced
+  replay; virtual nodes are never freed by the inverse memory.
+- `contract_edges`' successors keep the key `(edges, node1, node2)` without
+  `keep`/`rescale`; their hints are now the kernel. `a @ b` costs about +1 µs
+  per call in lookup and replay (12.1 → 13.0 µs on small tensors).
+- Pickling after a forward (review of #3): `contract_edges` on the core keeps
+  its kernel, a local function, in its successors, and `torch.save` failed.
+  `Successor.__getstate__` drops the kernel and the core's `fn_next` plans it
+  again when it is missing. The recording (nodes, successors, parameters)
+  survives, as on `main`. A first version reset the network on restore,
+  which stopped training (the optimizer held the per-node parameters),
+  crashed for a node restored before its network, and lost results of
+  operations called by hand.
+- `contract_between(..., rescale=True)` contracts nodes that share nothing
+  as an outer product, as a contraction path's step may; without `rescale`
+  it still raises.

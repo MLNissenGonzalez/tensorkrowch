@@ -3917,6 +3917,15 @@ class Successor:  # MARK: Successor
         self.child = child
         self.hints = hints
 
+    def __getstate__(self) -> Dict[Text, Any]:
+        # Pickled (or deep-copied) without the kernel, a local function that
+        # cannot be pickled; the operation plans it again in its next call
+        state = self.__dict__.copy()
+        if isinstance(self.hints, dict) and ('kernel' in self.hints):
+            state['hints'] = {key: value for key, value in self.hints.items()
+                              if key != 'kernel'}
+        return state
+
 
 ###############################################################################
 #                                TENSOR NETWORK                               #

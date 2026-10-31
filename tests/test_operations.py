@@ -13,6 +13,7 @@ This script contains tests for operations:
     * TestRQ
     * TestContractEdge
     * TestContractBetween
+    * TestContractKeepRescale
     * TestMergeSplitEdge
     * TestStackUnbind
     * TestEinsum
@@ -5032,6 +5033,335 @@ class TestContractBetween:  # MARK: TestContractBetween
         # disconnected and are not in the same network
         with pytest.raises(ValueError):
             node2 = node1.contract_between_(node1)
+
+
+@tk.operation
+def contract_rescale_reference_test_op(node1, node2):
+    """
+    The downstream operation of issue #1, which ``contract_between`` with
+    ``keep`` and ``rescale`` replaces: a dangling axis of the same name in
+    both nodes is kept once, and the result is divided by its largest |entry|
+    per sample, whose log is returned.
+    """
+    edges2 = {id(e) for e in node2.edges}
+    names2 = {ax.name for ax in node2.axes}
+    letters = iter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    sub1, sub2, out_axes, out_sub = [], [], [], []
+    letter_of_edge, merged = {}, set()
+    for ax in node1.axes:
+        edge = node1.get_edge(ax)
+        letter = next(letters)
+        sub1.append(letter)
+        if not edge.is_dangling() and id(edge) in edges2:
+            letter_of_edge[id(edge)] = letter
+            continue
+        if edge.is_dangling() and ax.name in names2 and \
+                node2.get_edge(ax.name).is_dangling():
+            merged.add(ax.name)
+            letter_of_edge[ax.name] = letter
+        out_axes.append(ax)
+        out_sub.append(letter)
+    for ax in node2.axes:
+        edge = node2.get_edge(ax)
+        if id(edge) in letter_of_edge:
+            sub2.append(letter_of_edge[id(edge)])
+        elif ax.name in merged:
+            sub2.append(letter_of_edge[ax.name])
+        else:
+            letter = next(letters)
+            sub2.append(letter)
+            out_axes.append(ax)
+            out_sub.append(letter)
+    equation = f"{''.join(sub1)},{''.join(sub2)}->{''.join(out_sub)}"
+    batch = [i for i, ax in enumerate(out_axes) if ax.is_batch()]
+    other = tuple(i for i in range(len(out_axes)) if i not in batch)
+
+    def kernel(tensor1, tensor2):
+        result = torch.einsum(equation, tensor1, tensor2)
+        magnitude = result.detach()
+        scale = magnitude.abs().amax(dim=other, keepdim=True) if other \
+            else magnitude.abs()
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        log_scale = scale.log().reshape(result.shape[batch[0]] if batch else ())
+        return result / scale, log_scale
+
+    return kernel, (out_axes, ["batch"] if batch else [])
+
+
+class TestContractKeepRescale:  # MARK: TestContractKeepRescale
+    
+    # Rescaled values have max |entry| 1: the atol is relative to the scale
+    RTOL = 1e-12
+    ATOL = 1e-12
+    
+    @staticmethod
+    def _case(case, dtype):
+        """Leaves, connected pairs, kept axes and order of contraction."""
+        def rand(*shape, std=1.):
+            return std * torch.randn(*shape, dtype=dtype)
+        
+        if case == 'batch_only':
+            leaves = [('p', rand(5, 3), ('batch', 'a')),
+                      ('q', rand(5, 4), ('batch', 'b'))]
+            return leaves, [], (), [('p', 'q')]
+        if case == 'kept_summed':
+            leaves = [('p', rand(5, 3, 4, 2), ('batch', 'x', 's', 'u')),
+                      ('q', rand(5, 4, 3, 6), ('batch', 't', 'x', 'v'))]
+            return leaves, [(('p', 's'), ('q', 't'))], ('x',), [('p', 'q')]
+        # chain: bond 6, std 4, ~1e40 after 40 steps
+        leaves = [(f'm{i}', rand(3, 6, 6, std=4.), ('batch', 'left', 'right'))
+                  for i in range(40)]
+        pairs = [((f'm{i}', 'right'), (f'm{i + 1}', 'left')) for i in range(39)]
+        order = [('m0', 'm1')] + [(None, f'm{i}') for i in range(2, 40)]
+        return leaves, pairs, (), order
+    
+    @staticmethod
+    def _run(leaves, pairs, kept, order, reference):
+        net = tk.TensorNetwork()
+        nodes = {name: tk.ParamNode(tensor=tensor, axes_names=axes,
+                                    name=name, network=net)
+                 for name, tensor, axes in leaves}
+        for (n1, a1), (n2, a2) in pairs:
+            nodes[n1][a1] ^ nodes[n2][a2]
+        
+        result, log_scale = None, None
+        for first, second in order:
+            node1 = result if first is None else nodes[first]
+            if reference:
+                result, log_n = contract_rescale_reference_test_op(
+                    node1, nodes[second])
+            else:
+                result, log_n = tk.contract_between(node1, nodes[second],
+                                                    keep=kept, rescale=True)
+            log_scale = log_n if log_scale is None else log_scale + log_n
+        return nodes, result, log_scale
+    
+    @pytest.mark.parametrize('case', ['batch_only', 'kept_summed', 'chain'])
+    @pytest.mark.parametrize('dtype', [torch.float64, torch.complex128])
+    def test_matches_downstream_operation(self, case, dtype):
+        torch.manual_seed(0)
+        spec = self._case(case, dtype)
+        ref_nodes, ref, ref_log = self._run(*spec, reference=True)
+        nodes, result, log_scale = self._run(*spec, reference=False)
+        
+        names = ref.axes_names
+        assert sorted(result.axes_names) == sorted(names)
+        tensor = result.tensor.permute(
+            [result.axes_names.index(name) for name in names])
+        assert torch.allclose(tensor, ref.tensor,
+                              rtol=self.RTOL, atol=self.ATOL)
+        assert log_scale.axes_names == ref_log.axes_names
+        assert torch.allclose(log_scale.tensor, ref_log.tensor,
+                              rtol=self.RTOL, atol=self.ATOL)
+        
+        for res, log in [(ref, ref_log), (result, log_scale)]:
+            (res.tensor.abs().sum() + log.tensor.sum()).backward()
+        for name in nodes:
+            grad, ref_grad = nodes[name].grad, ref_nodes[name].grad
+            assert torch.allclose(grad, ref_grad, rtol=self.RTOL,
+                                  atol=self.ATOL * ref_grad.abs().max())
+    
+    @pytest.mark.parametrize('dtype', [torch.float64, torch.complex128])
+    def test_chain_log_value_and_overflow(self, dtype):
+        torch.manual_seed(0)
+        leaves, pairs, kept, order = self._case('chain', dtype)
+        _, result, log_scale = self._run(leaves, pairs, kept, order, False)
+        
+        dense = leaves[0][1]
+        for _, tensor, _ in leaves[1:]:
+            dense = dense @ tensor
+        log_value = result.tensor.detach().abs().log() + \
+            log_scale.tensor.detach()[:, None, None]
+        assert torch.allclose(log_value, dense.abs().log(), rtol=1e-10)
+        
+        # Without rescaling, the chain overflows in single precision
+        single = torch.complex64 if dtype.is_complex else torch.float32
+        unscaled = leaves[0][1].to(single)
+        for _, tensor, _ in leaves[1:]:
+            unscaled = unscaled @ tensor.to(single)
+        assert not unscaled.isfinite().all()
+    
+    def test_trace_and_replay(self):
+        torch.manual_seed(0)
+        leaves, pairs, kept, order = self._case('chain', torch.float64)
+        
+        class ChainTN(tk.TensorNetwork):
+            
+            def __init__(self):
+                super().__init__(name='chain')
+                self.leaves = {name: tk.ParamNode(tensor=tensor,
+                                                  axes_names=axes,
+                                                  name=name,
+                                                  network=self)
+                               for name, tensor, axes in leaves}
+                for (n1, a1), (n2, a2) in pairs:
+                    self.leaves[n1][a1] ^ self.leaves[n2][a2]
+            
+            def contract(self):
+                result, log_scale = None, None
+                for first, second in order:
+                    node1 = result if first is None else self.leaves[first]
+                    result, log_n = node1.contract_between(self.leaves[second],
+                                                           rescale=True)
+                    log_scale = log_n if log_scale is None else log_scale + log_n
+                return result, log_scale
+        
+        net = ChainTN()
+        expected = [tensor.detach() for tensor in net()]
+        net.trace()
+        resultant = dict(net.resultant_nodes)
+        n_ops = len(net._seq_ops)
+        for _ in range(2):
+            for tensor, exp in zip(net(), expected):
+                assert torch.allclose(tensor, exp, rtol=self.RTOL,
+                                      atol=self.ATOL)
+            # The second call reuses the resultant nodes
+            assert net.resultant_nodes == resultant
+            assert len(net._seq_ops) == n_ops
+    
+    def test_keep(self):
+        net = tk.TensorNetwork()
+        ket = tk.randn(shape=(5, 3, 4), axes_names=('batch', 'x', 'right'),
+                       network=net)
+        bra = tk.randn(shape=(5, 4, 3), axes_names=('batch', 'left', 'x'),
+                       network=net)
+        ket['right'] ^ bra['left']
+        
+        result = tk.contract_between(ket, bra, keep='x')
+        assert result.axes_names == ['batch', 'x']
+        assert result['x'] is ket['x']
+        assert torch.allclose(result.tensor,
+                              torch.einsum('bxr,brx->bx',
+                                           ket.tensor, bra.tensor))
+        
+        # Same as a list, and cached with its own key
+        assert ket.contract_between(bra, keep=['x']) is result
+        assert ket.successors['contract_edges'][
+            (None, ket, bra, ('x',), False)].child is result
+        
+        # Without keep, as before: both legs are kept, as an outer product
+        result2 = ket @ bra
+        assert result2.axes_names == ['batch', 'x_0', 'x_1']
+        assert ket.successors['contract_edges'][(None, ket, bra)].child \
+            is result2
+    
+    def test_shared_batch_or_kept_only(self):
+        net = tk.TensorNetwork()
+        node1 = tk.randn(shape=(5, 3), axes_names=('batch', 'a'), network=net)
+        node2 = tk.randn(shape=(5, 4), axes_names=('batch', 'b'), network=net)
+        result = node1 @ node2
+        assert result.axes_names == ['batch', 'a', 'b']
+        assert torch.allclose(result.tensor,
+                              torch.einsum('ba,bc->bac',
+                                           node1.tensor, node2.tensor))
+        
+        node3 = tk.randn(shape=(3, 2), axes_names=('a', 'c'), network=net)
+        result = tk.contract_between(node1, node3, keep='a')
+        assert result.axes_names == ['a', 'batch', 'c']
+        assert torch.allclose(result.tensor,
+                              torch.einsum('ba,ac->abc',
+                                           node1.tensor, node3.tensor))
+        
+        # Nothing shared: an error, unless the contraction rescales
+        node4 = tk.randn(shape=(2,), axes_names=('c',), network=net)
+        with pytest.raises(ValueError, match='No batch edges, kept edges'):
+            node1 @ node4
+    
+    @pytest.mark.parametrize('batch', [False, True])
+    def test_rescale_nothing_shared(self, batch):
+        # A step of a contraction path may pair nodes that share nothing
+        net = tk.TensorNetwork()
+        node1 = tk.randn(shape=(2, 3), axes_names=('a', 'b'), network=net,
+                         dtype=torch.float64)
+        shape, names = ((5, 4), ('batch', 'c')) if batch else ((4,), ('c',))
+        node2 = tk.randn(shape=shape, axes_names=names, network=net,
+                         dtype=torch.float64)
+        for _ in range(2):  # recorded, then replayed
+            result, log_scale = tk.contract_between(node1, node2,
+                                                    rescale=True)
+            assert result.axes_names == ['a', 'b'] + list(names)
+            value = result.tensor * log_scale.tensor.exp().reshape(
+                (1, 1, 5, 1) if batch else ())
+            expected = torch.einsum('ab,...c->ab...c', node1.tensor,
+                                    node2.tensor)
+            assert torch.allclose(value, expected)
+    
+    def test_rescale(self):
+        net = tk.TensorNetwork()
+        node1 = tk.randn(shape=(5, 3), axes_names=('batch', 'a'), network=net)
+        node2 = tk.randn(shape=(3,), axes_names=('a',), network=net)
+        node1['a'] ^ node2['a']
+        
+        result, log_scale = tk.contract_between(node1, node2, rescale=True)
+        assert log_scale.axes_names == ['batch']
+        assert log_scale['batch'] is node1['batch']
+        assert torch.allclose(result.tensor.abs(), torch.ones(5))
+        assert torch.allclose(result.tensor * log_scale.tensor.exp(),
+                              node1.tensor @ node2.tensor)
+        
+        # A zero result keeps scale 1. Without batch, the log-scale node has
+        # no axes
+        node3 = tk.zeros(shape=(3,), axes_names=('a',), network=net)
+        node4 = tk.randn(shape=(3,), axes_names=('a',), network=net)
+        node3['a'] ^ node4['a']
+        result, log_scale = node3.contract_between(node4, rescale=True)
+        assert log_scale.shape == ()
+        assert result.tensor == 0. and log_scale.tensor == 0.
+    
+    def test_rescale_stack(self):
+        net = tk.TensorNetwork()
+        nodes1 = [tk.randn(shape=(5, 2, 3),
+                           axes_names=('batch', 'left', 'right'),
+                           network=net)
+                  for _ in range(4)]
+        nodes2 = [tk.randn(shape=(5, 3, 2),
+                           axes_names=('batch', 'left', 'right'),
+                           network=net)
+                  for _ in range(4)]
+        for node1, node2 in zip(nodes1, nodes2):
+            node1['right'] ^ node2['left']
+        stack1, stack2 = tk.stack(nodes1), tk.stack(nodes2)
+        stack1['right'] ^ stack2['left']
+        
+        result, log_scale = stack1.contract_between(stack2, rescale=True)
+        assert isinstance(log_scale, tk.StackNode)
+        assert log_scale.axes_names == ['stack', 'batch']
+        for unbound, log, node1, node2 in zip(tk.unbind(result),
+                                              tk.unbind(log_scale),
+                                              nodes1, nodes2):
+            assert torch.allclose(unbound.tensor * log.tensor.exp()[:, None, None],
+                                  node1.tensor @ node2.tensor)
+    
+    def test_errors(self):
+        net = tk.TensorNetwork()
+        node1 = tk.randn(shape=(5, 3, 4), axes_names=('batch', 'x', 'y'),
+                         network=net)
+        node2 = tk.randn(shape=(5, 2, 4), axes_names=('batch', 'x', 'y'),
+                         network=net)
+        node3 = tk.randn(shape=(4,), axes_names=('z',), network=net)
+        node1['y'] ^ node3['z']
+        
+        # Kept axes should be dangling axes of both nodes, of the same size
+        with pytest.raises(ValueError, match='same size'):
+            tk.contract_between(node1, node2, keep='x')
+        with pytest.raises(ValueError, match='dangling axis of both nodes'):
+            tk.contract_between(node1, node2, keep='w')
+        with pytest.raises(ValueError, match='dangling axis of both nodes'):
+            tk.contract_between(node1, node2, keep='y')
+        
+        # Not in a trace
+        node4 = tk.randn(shape=(5, 2, 2), axes_names=('batch', 'i', 'j'),
+                         network=net)
+        node4['i'] ^ node4['j']
+        with pytest.raises(ValueError, match='with itself'):
+            tk.contract_edges([node4['i']], node4, node4, keep='batch')
+        
+        with pytest.raises(TypeError, match='`keep`'):
+            tk.contract_between(node1, node3, keep=3)
+        with pytest.raises(TypeError, match='`keep`'):
+            tk.contract_between(node1, node3, keep=[3])
+        with pytest.raises(TypeError, match='`rescale`'):
+            tk.contract_between(node1, node3, rescale=1)
 
 
 class TestMergeSplitEdge:  # MARK: TestMergeSplitEdge
