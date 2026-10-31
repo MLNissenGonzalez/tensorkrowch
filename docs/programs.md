@@ -8,7 +8,8 @@ and the norm, or marginals over different sets of observed variables. Set
 same arguments replays it. Nothing is declared before the loop. Data that
 differ between contractions go into *input nodes* that `contract` creates.
 `net.free_intermediates = True` (optional) makes every program erase its
-intermediate tensors as soon as it has used them: memory, not speed.
+tensors, each as soon as it has used it and the rest when the call returns,
+so that the network holds nothing of a call: memory, not speed.
 
 Parts: the recipe for a training loop (§1), what happens underneath (§2),
 design choices (§3), implementation (§4), and a larger example with the
@@ -141,7 +142,11 @@ wiring) does not run again.
 `forward` replays from the second call in any case. With
 `net.free_intermediates = True`, every program erases each intermediate
 tensor (of resultant and data nodes) as soon as it has read it for the last
-time, so the network holds nothing between calls:
+time while it replays, and, when the call returns (also the call that
+records it), every tensor of its own that is left: its outputs, its input
+nodes, and results that nothing reads. Parameters, and the nodes that only
+reference them (`copy_node`), keep theirs. So the network holds nothing
+between calls:
 
 | n = 100, r = 64, batch 256, under `torch.no_grad` | one call | intermediates the network holds afterwards |
 |---|---|---|
@@ -149,8 +154,12 @@ time, so the network holds nothing between calls:
 | on | 27 ms | 0 MB |
 
 With autograd, the graph keeps what `backward` needs anyway; then it only
-drops the network's own references. Without autograd (evaluation,
-sampling), it also lowers the peak during the call.
+drops the network's own references. Those references matter when a result
+is dropped without `backward` (an evaluation with gradients enabled): an
+output node would keep the result's whole graph until the program's next
+call, one graph per program. With the setting, the returned tensors are
+the caller's alone, and dropping them frees the graph. Without autograd
+(evaluation, sampling), it also lowers the peak during the call.
 
 It is one setting for the network: it holds for every program, recorded
 before or after it is set, and `reset` keeps it. Every recording counts how
@@ -159,9 +168,10 @@ the first step. `trace(example, *args)` records the program of `args` and
 switches it on.
 
 It is off by default because it changes what a network shows after a call:
-the tensors of intermediate nodes are `None`. Code that reads them (when
-debugging, or an operation called after `forward` on an intermediate node)
-would fail, and the gain is memory only.
+the tensors of the program's nodes, outputs included, are `None`. Code that
+reads them (when debugging, or an operation called after `forward` on an
+intermediate or output node) would fail, and the gain is memory only. The
+call's return value is the way to the outputs.
 
 ### 1.4 Inputs
 
@@ -395,14 +405,28 @@ A network takes its data either in data nodes or in input nodes;
 `input_node` raises in a network with data nodes, so `net(data)` always
 knows where `data` goes (data nodes if the network has them or overrides
 `set_data_nodes`, else the program's input nodes). Input nodes are virtual
-nodes: `free_intermediates` does not erase them (they hold the inputs until
-the next call), and `reset` deletes them with their program.
+nodes: `free_intermediates` erases their tensors when the call returns
+(every call fills them: a program with input nodes needs data in every
+call), and `reset` deletes them with their program.
 
 ### 3.6 Freeing: one setting for the network
 
 `free_intermediates` holds for every program. Rejected: freeing per program
 (`trace(example, *args)` once per argument set), which needs the list of
-argument sets before the loop. Every recording counts reads (before, only
+argument sets before the loop; and a second setting for the outputs and
+inputs, since a caller that wants them has the call's return value and its
+own data.
+
+What a call leaves is decided by one rule, `_erasable` (resultant and data
+nodes, and `stack_data_memory`), which the inverse memory also uses: when
+the call returns, `Program._free` erases the memory of every erasable node
+the program reads or computes, and of its input nodes. The list is made
+once per recording, with the steps. Rejected: erasing the inverse memory's
+erasable entries plus the outputs and inputs, which misses a result that
+nothing reads and the program does not return (the log-scale of a
+rescaled contraction whose scale is not wanted), and which, applied to
+every output, would erase a parameter returned by the program (or fail on
+a copy of one). Every recording counts reads (before, only
 `trace`'s did): a dict update per operand while recording, no effect until
 freeing is on. `trace` records through `self(example, *args)`, because
 subclasses override `forward` and may turn their arguments into others
@@ -443,7 +467,7 @@ contraction method that returns several outputs from one program.
 
 | what | where |
 |---|---|
-| `Program` | end of the module: `_clear`, `__call__` (where the data goes; record, fill inputs, replay), `_fill_inputs`, `_record` (runs `fn`, checks outputs, marks them not erasable, resolves the steps), `_eager_state` |
+| `Program` | end of the module: `_clear`, `__call__` (where the data goes; record, fill inputs, replay, free), `_free`, `_fill_inputs`, `_record` (runs `fn`, checks outputs, marks them not erasable during the replay, resolves the steps), `_find_steps` (the steps and the nodes `_free` erases), `_eager_state`; `_erasable` (the rule, a module function) before it |
 | network state | `TensorNetwork.__init__`: `_eager`, `_program`, `_programs` (key → Program), `_max_programs`, `_free_intermediates`, `_generation` |
 | properties to the program being called | `_seq_ops`, `_inverse_memory`, `_recording`; `_freeing` is a plain attribute that `Program.__call__` sets around its replay (read by every `fn_next`) |
 | `max_programs`, `free_intermediates`, `_full` | after `resultant_nodes` |
@@ -474,7 +498,9 @@ program(data)
   input data -> _fill_inputs
   recorded before, or inputs filled -> for each step: fn_next(successor, *args)
   net._program = net._eager
-  return the outputs' tensors
+  outputs = the outputs' tensors
+  free_intermediates -> _free: erase the program's erasable nodes and inputs
+  return outputs
 ```
 
 Outside programs, operations use `net._eager`, a program that is never

@@ -1748,12 +1748,8 @@ class AbstractNode(ABC):  # MARK: AbstractNode
                 net._inverse_memory[node_ref]['accessed'] += 1
         else:
             # Node can only be erased if both itself and the node from which
-            # it is taking the tensor information (node_ref) are resultant or
-            # data nodes (including virtual node that stores stack data tensor)
-            erase = True
-            for node in check_nodes:
-                erase &= node.is_resultant() or node._data or \
-                    (node._virtual and node._name == 'stack_data_memory')
+            # it is taking the tensor information (node_ref) are erasable
+            erase = all([_erasable(node) for node in check_nodes])
 
             net._inverse_memory[node_ref] = {
                 'accessed': 1,
@@ -4244,15 +4240,24 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
     @property
     def free_intermediates(self) -> bool:
         """
-        Whether the :class:`Programs <Program>` of the network erase each
-        intermediate tensor (of ``resultant`` and ``data`` nodes) as soon as
-        they have read it for the last time, in every call after their
-        recording; ``False`` by default. It holds for all programs, recorded
-        or not, and is kept by :meth:`reset`. :meth:`trace` sets it.
+        Whether the :class:`Programs <Program>` of the network erase the
+        tensors they compute or are given; ``False`` by default. It holds for
+        all programs, recorded or not, and is kept by :meth:`reset`.
+        :meth:`trace` sets it.
         
-        This saves memory, not time: the network holds no intermediate tensor
+        A program then erases each intermediate tensor (of ``resultant`` and
+        ``data`` nodes) as soon as it has read it for the last time, while it
+        replays; and, at the end of every call, also the call that records
+        it, every tensor of its own that is left: intermediates, results that
+        nothing reads, its outputs and its input nodes. The tensors a call
+        returns belong to the caller: once dropped, they and their autograd
+        graph are freed, even without ``backward``. Parameters (``leaf``
+        nodes), and nodes that only reference their memory, are not erased.
+        
+        This saves memory, not time: the network holds no tensor of a program
         between calls (autograd keeps what ``backward`` needs on its own).
-        With it, the tensors of intermediate nodes are ``None`` after a call.
+        With it, the program's nodes, outputs included, hold ``None`` after a
+        call.
         
         Raises
         ------
@@ -5439,8 +5444,10 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         
         If :meth:`contract` returns a tuple of nodes, ``forward`` returns a
         tuple with their tensors, and these nodes can come from any
-        operation. Their tensors are not erased from memory after the
-        contraction, even if they are used in later operations.
+        operation. Their tensors are not erased during the contraction, even
+        if they are used in later operations; with
+        :attr:`free_intermediates`, the nodes hold ``None`` after the call
+        (the returned tensors are the caller's).
         
         For an example, check this :ref:`tutorial <tutorial_5>`.
 
@@ -5543,6 +5550,16 @@ def _hashable_arg(arg: Any) -> Any:
 ###############################################################################
 #                                   PROGRAM                                   #
 ###############################################################################
+def _erasable(node: AbstractNode) -> bool:
+    """Whether the memory a node stores may be erased by a program that frees
+    its tensors (:attr:`TensorNetwork.free_intermediates`): that of resultant
+    and data nodes (and of ``"stack_data_memory"``), which the next call
+    computes or sets again; not that of leaf nodes (parameters) or other
+    virtual nodes."""
+    return node.is_resultant() or node._data or \
+        (node._virtual and node._name == 'stack_data_memory')
+
+
 class Program:  # MARK: Program
     """
     Operations recorded from one call of ``fn``, which contracts nodes of
@@ -5562,8 +5579,9 @@ class Program:  # MARK: Program
     
     Each program has its own resultant nodes (operations do not share
     results across programs), and, with
-    :attr:`~TensorNetwork.free_intermediates`, erases its intermediate
-    tensors in every call, as soon as it does not use them anymore. So
+    :attr:`~TensorNetwork.free_intermediates`, erases its tensors in every
+    call: each intermediate as soon as it does not use it anymore, and what
+    is left (outputs, inputs) when the call returns. So
     several programs can contract the same nodes in different ways:
     :meth:`TensorNetwork.forward` keeps one per set of arguments of
     :meth:`~TensorNetwork.contract`.
@@ -5620,6 +5638,7 @@ class Program:  # MARK: Program
         self._single = True         # whether fn returns a node, not a tuple
         self._inputs = []           # input nodes, created while recording
         self._inverse_memory = dict()
+        self._erasable = []         # nodes whose memory a call frees at its end
         self._recording = False
         self._generation = None     # network's generation when recorded
 
@@ -5700,9 +5719,22 @@ class Program:  # MARK: Program
             net._program = net._eager
             net._freeing = False
         
-        if self._single:
-            return self._outputs[0].tensor
-        return tuple(node.tensor for node in self._outputs)
+        outputs = tuple(node.tensor for node in self._outputs)
+        if net._free_intermediates:
+            self._free()
+        return outputs[0] if self._single else outputs
+
+    def _free(self) -> None:
+        """Erases the tensors of the program's nodes (:attr:`free_intermediates
+        <TensorNetwork.free_intermediates>`), after a call: the tensors it
+        computed (intermediates, outputs, and results that nothing reads), the
+        data it read and its inputs. Parameters, and nodes that reference
+        another node's memory, are not erased."""
+        memory = self._network._memory_nodes
+        for node in self._erasable:
+            address = node._tensor_info['address']
+            if address is not None:
+                memory[address] = None
 
     def _fill_inputs(self, data: Sequence[Tensor]) -> None:
         if not self._inputs:
@@ -5754,9 +5786,27 @@ class Program:  # MARK: Program
 
     def _find_steps(self) -> None:
         """The recorded operations, with their successors (in the program's
-        cache), so that replaying does not search them."""
+        cache), so that replaying does not search them; and the nodes whose
+        memory a call frees at its end (see :meth:`_free`)."""
         operations = TensorNetwork.operations
         self._steps = [(operations[name].fn_next,
                         operations[name].check_first(*args),
                         args)
                        for name, args in self._seq_ops]
+        
+        # The nodes storing the memory of the operands (inverse memory) and of
+        # the results, and the inputs (a dict keeps them once, in order).
+        # Memory is kept if it is not erasable (parameters), or if a node that
+        # is not erasable reads it: leaf nodes stacked with ``auto_stack`` read
+        # theirs from the stack, which is a resultant node
+        nodes = dict.fromkeys(self._inverse_memory)
+        for _, successor, _ in self._steps:
+            children = successor.child
+            if not isinstance(children, (list, tuple)):
+                children = (children,)
+            nodes.update(dict.fromkeys([node.node_ref() for node in children]))
+        kept = {node.node_ref() for node in self._network.nodes.values()
+                if not _erasable(node)}
+        self._erasable = [node for node in nodes
+                          if _erasable(node) and (node not in kept)] + \
+            list(self._inputs)
