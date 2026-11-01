@@ -1044,7 +1044,9 @@ class TestMPS:  # MARK: TestMPS
         example = torch.randn(1, n_features, 5)
         data = torch.randn(2, n_features, 5)
 
-        mps.trace(example)
+        # Recorded and replayed without free_intermediates (which trace
+        # sets), so that the resultant nodes keep tensors to move
+        _ = mps(example)
         _ = mps(data)
 
         assert mps.resultant_nodes
@@ -3347,7 +3349,9 @@ class TestUMPS:  # MARK: TestUMPS
         example = torch.randn(1, n_features, 5)
         data = torch.randn(2, n_features, 5)
 
-        mps.trace(example)
+        # Recorded and replayed without free_intermediates (which trace
+        # sets), so that the resultant nodes keep tensors to move
+        _ = mps(example)
         _ = mps(data)
 
         assert mps.resultant_nodes
