@@ -4253,6 +4253,9 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         returns belong to the caller: once dropped, they and their autograd
         graph are freed, even without ``backward``. Parameters (``leaf``
         nodes), and nodes that only reference their memory, are not erased.
+        A ``resultant`` node computed outside the program (by an operation
+        called before it) and read in it is erased like the program's own:
+        a later call finds ``None`` there, as a replay did before.
         
         This saves memory, not time: the network holds no tensor of a program
         between calls (autograd keeps what ``backward`` needs on its own).
@@ -5638,7 +5641,7 @@ class Program:  # MARK: Program
         self._single = True         # whether fn returns a node, not a tuple
         self._inputs = []           # input nodes, created while recording
         self._inverse_memory = dict()
-        self._erasable = []         # nodes whose memory a call frees at its end
+        self._to_free = []          # nodes whose memory a call frees at its end
         self._recording = False
         self._generation = None     # network's generation when recorded
 
@@ -5731,7 +5734,7 @@ class Program:  # MARK: Program
         data it read and its inputs. Parameters, and nodes that reference
         another node's memory, are not erased."""
         memory = self._network._memory_nodes
-        for node in self._erasable:
+        for node in self._to_free:
             address = node._tensor_info['address']
             if address is not None:
                 memory[address] = None
@@ -5807,6 +5810,6 @@ class Program:  # MARK: Program
             nodes.update(dict.fromkeys([node.node_ref() for node in children]))
         kept = {node.node_ref() for node in self._network.nodes.values()
                 if not _erasable(node)}
-        self._erasable = [node for node in nodes
-                          if _erasable(node) and (node not in kept)] + \
+        self._to_free = [node for node in nodes
+                         if _erasable(node) and (node not in kept)] + \
             list(self._inputs)

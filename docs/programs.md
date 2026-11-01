@@ -145,8 +145,12 @@ tensor (of resultant and data nodes) as soon as it has read it for the last
 time while it replays, and, when the call returns (also the call that
 records it), every tensor of its own that is left: its outputs, its input
 nodes, and results that nothing reads. Parameters, and the nodes that only
-reference them (`copy_node`), keep theirs. So the network holds nothing
-between calls:
+reference them (`copy_node`), keep theirs. A resultant node computed
+outside the program (by an operation called before it) and read in it is
+erased too, since the rule looks at the kind of node, not at who computed
+it: a later call finds `None` there (now when the recording call returns;
+before, after the first replay). So the network holds nothing between
+calls:
 
 | n = 100, r = 64, batch 256, under `torch.no_grad` | one call | intermediates the network holds afterwards |
 |---|---|---|
@@ -467,7 +471,7 @@ contraction method that returns several outputs from one program.
 
 | what | where |
 |---|---|
-| `Program` | end of the module: `_clear`, `__call__` (where the data goes; record, fill inputs, replay, free), `_free`, `_fill_inputs`, `_record` (runs `fn`, checks outputs, marks them not erasable during the replay, resolves the steps), `_find_steps` (the steps and the nodes `_free` erases), `_eager_state`; `_erasable` (the rule, a module function) before it |
+| `Program` | end of the module: `_clear`, `__call__` (where the data goes; record, fill inputs, replay, free), `_free`, `_fill_inputs`, `_record` (runs `fn`, checks outputs, marks them not erasable during the replay, resolves the steps), `_find_steps` (the steps and `_to_free`, the nodes `_free` erases), `_eager_state`; `_erasable` (the rule, a module function) before it |
 | network state | `TensorNetwork.__init__`: `_eager`, `_program`, `_programs` (key → Program), `_max_programs`, `_free_intermediates`, `_generation` |
 | properties to the program being called | `_seq_ops`, `_inverse_memory`, `_recording`; `_freeing` is a plain attribute that `Program.__call__` sets around its replay (read by every `fn_next`) |
 | `max_programs`, `free_intermediates`, `_full` | after `resultant_nodes` |

@@ -330,8 +330,12 @@ are in `docs/programs.md`.
 - One rule, `_erasable` (resultant and data nodes, `stack_data_memory`),
   shared with the inverse memory. Memory that a non-erasable node reads is
   kept: with `auto_stack`, stacked plain leaf nodes read theirs from the
-  stack, which is a resultant node. The list of nodes to erase is made once
-  per recording (`_find_steps`).
+  stack, which is a resultant node. The list of nodes to erase
+  (`Program._to_free`) is made once per recording (`_find_steps`).
+- A resultant node computed outside a program (an eager `env = a @ b`) and
+  read in it is erased like the program's own: `Program(net, lambda: env @ c)`
+  works once, then raises `AttributeError` (on `9288d0b`, twice: the replay
+  freed it). Recompute it inside the program, or keep freeing off.
 - Output nodes hold `None` after a call with the setting on; `trace` turns
   it on. Nothing in the library read them; two tests did
   (`test_to_contracted`, MPS and UMPS), which now contract without it.
