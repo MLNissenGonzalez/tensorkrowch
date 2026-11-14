@@ -4444,6 +4444,10 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         kept by the node. To completely get rid of the node, it should be first
         disconnected from all its neighbours (that belong to the network) and
         then removed. This is what :meth:`delete_node` does.
+        
+        The node's tensor is not kept: a caller that keeps the node
+        (:meth:`~AbstractNode.move_to_network`, an override in
+        :meth:`_add_node`) stores ``node.tensor`` in ``_temp_tensor`` first.
 
         Parameters
         ----------
@@ -5115,10 +5119,10 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                 node._successor_caches = dict()
                 
                 if not node._leaf:
-                    # Resultant nodes and virtual nodes are kept as they are:
-                    # the first are deleted below, without reading their
-                    # tensors, and so are the virtual ones named
-                    # "virtual_result" (e.g. ParamStackNodes, copies of nodes)
+                    # Only leaf nodes get their own memory back. Resultant
+                    # and "virtual_result" nodes are deleted below as they are
+                    # (deletion reads no tensor); the other virtual nodes
+                    # (e.g. "virtual_uniform") are kept
                     continue
 
                 node_ref = node._tensor_info['node_ref']
