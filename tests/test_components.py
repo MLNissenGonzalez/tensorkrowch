@@ -4256,6 +4256,42 @@ class TestProgram:  # MARK: TestProgram
                 for param in params:
                     param.add_(0.1 * torch.randn_like(param))
     
+    class CopiedPair(tk.TensorNetwork):
+        """Two nodes, contracted through copies of them."""
+        
+        def __init__(self):
+            super().__init__(name='pair')
+            self.a = tk.randn(shape=(3, 4), axes_names=('input', 'right'),
+                              name='a', network=self, param_node=True)
+            self.b = tk.randn(shape=(4, 3), axes_names=('left', 'input'),
+                              name='b', network=self, param_node=True)
+            self.a['right'] ^ self.b['left']
+        
+        def contract(self):
+            copy_a, copy_b = self.copy_node(self.a), self.copy_node(self.b)
+            copy_a['right'] ^ copy_b['left']
+            return copy_a @ copy_b
+    
+    @pytest.mark.parametrize('mode', [None, 'auto_stack', 'auto_unbind'])
+    def test_reset_after_copied_edge_changed_size(self, mode):
+        # The copies keep their dangling edges at the old size while sharing
+        # the resized tensors: reset deletes them all the same, and the next
+        # call is recorded with the new sizes
+        net = self.CopiedPair()
+        if mode is not None:
+            setattr(net, mode, True)
+        net()
+        copies = [node for node in net.virtual_nodes.values()
+                  if node.name.startswith('virtual_result_copy')]
+        assert len(copies) == 2
+        
+        net['a']['right'].change_size(2)
+        net.reset()
+        assert all(copy.network is None for copy in copies)
+        result = net()
+        assert result.shape == (3, 3)
+        assert torch.allclose(result, net.a.tensor @ net.b.tensor)
+    
     def test_tensor_argument(self):
         class ScaledTN(tk.TensorNetwork):
             def __init__(self):

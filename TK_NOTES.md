@@ -343,3 +343,28 @@ are in `docs/programs.md`.
   on. Separately, deep-copying a network with many nodes (a 43-site tree
   network after one pattern) exceeds Python's default recursion limit
   (1000), with or without the setting.
+
+## Since: issue #8, `reset` after an edge of a copied node changed size (2026-11-14)
+
+- Deleting a node no longer reads its tensor. `_remove_node` kept it as
+  `_temp_tensor`, which `delete_node` dropped on the next line, and
+  `_unassign_node_name` read it only to see whether it was a `Parameter`
+  (now: a `param_<name>` attribute is the node's own, names being unique).
+  Both reads could follow a `node_ref` to a node deleted before, which is
+  why `reset` gave every node its own memory before deleting any.
+- `reset` re-sets only the leaf nodes. Resultant and `virtual_result` nodes
+  are deleted as they are, in any order. The re-set raised for a copy
+  (`copy_node`) of a node whose edge changed size since the program was
+  recorded: the copy shares the resized tensor, its dangling edges keep the
+  old size, and cropping to them failed.
+- The two callers that remove a node and keep it (`move_to_network`, and a
+  node overridden in `_add_node`, e.g. by `parameterize`) read its tensor
+  first, as `_remove_node` did.
+- Live tensors, nodes, `_memory_nodes` and parameters after `reset`: the
+  same as before on the MPS (`auto_stack`/`auto_unbind`), Tree and
+  copy-node cases measured. `reset` allocates nothing for the nodes it
+  deletes: 6.8 → 4.4 ms (9.2 → 4.9 ms with `auto_stack`) on a 100-site,
+  rank-20 MPS with a norm of copies, CPU.
+- Still open: with `auto_stack`, `change_size` on a leaf node whose memory is
+  in a stack (after a call, before `reset`) raises `TypeError` in
+  `_save_in_network` (its address is `None`).

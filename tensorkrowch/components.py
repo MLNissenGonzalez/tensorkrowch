@@ -1804,6 +1804,7 @@ class AbstractNode(ABC):  # MARK: AbstractNode
                 visited = []
             if self not in visited:
                 if self._network is not None:
+                    self._temp_tensor = self.tensor
                     self._network._remove_node(self)
                 network._add_node(self)
                 visited.append(self)
@@ -4432,6 +4433,7 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
         """
         if override:
             prev_node = self.nodes[node._name]
+            prev_node._temp_tensor = prev_node.tensor
             self._remove_node(prev_node)
         self._assign_node_name(node, node._name, True)
 
@@ -4454,7 +4456,6 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
             each resultant node has the same enumeration as the corresponding
             original node.
         """
-        node._temp_tensor = node.tensor
         node._tensor_info = None
         node._network = None
 
@@ -4718,10 +4719,11 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
             each resultant node has the same enumeration as the corresponding
             original node.
         """
-        # Node is ParamNode and tensor is not None
-        if isinstance(node.tensor, Parameter):
-            if hasattr(self, 'param_' + node._name):
-                delattr(self, 'param_' + node._name)
+        # A parameter named after the node is the node's own tensor (names
+        # are unique). Not read through ``node.tensor``, which can follow a
+        # reference to a node deleted before
+        if hasattr(self, 'param_' + node._name):
+            delattr(self, 'param_' + node._name)
         for edge in node._edges:
             if edge.is_attached_to(node):
                 self._remove_edge(edge)
@@ -5112,11 +5114,11 @@ class TensorNetwork(nn.Module):  # MARK: TensorNetwork
                 # those of virtual nodes that are kept
                 node._successor_caches = dict()
                 
-                if node._virtual and ('virtual_result' not in node._name):
-                    # Virtual nodes named "virtual_result" are nodes that are
-                    # required in some situations during contraction, like
-                    # ParamStackNodes
-                    # This condition is satisfied by the rest of virtual nodes
+                if not node._leaf:
+                    # Resultant nodes and virtual nodes are kept as they are:
+                    # the first are deleted below, without reading their
+                    # tensors, and so are the virtual ones named
+                    # "virtual_result" (e.g. ParamStackNodes, copies of nodes)
                     continue
 
                 node_ref = node._tensor_info['node_ref']
