@@ -384,9 +384,17 @@ are in `docs/programs.md`.
   one per bond, or `None`) and keyword-only `cutoff`, `atol`, `rtol`,
   `cum_percentage`, each cut also capped by its numerical rank. The rule is
   `utils._truncation_rank`, which `truncated_svd` now calls too (and
-  `_check_truncation` its checks), so the two cannot drift: `truncated_svd`
-  gives the same bits as before on 16000 calls (option grid, real, complex,
-  batched, zero).
+  `_check_truncation` its checks), so the two cannot drift.
+- `rtol` / `cum_percentage` no longer depend on the scale (#12's review): the
+  singular values are clamped at eps times their row's largest, not at an
+  absolute eps (an all-zero row still at eps). The absolute clamp lifted every
+  value of a matrix whose largest is below eps to eps, so the criterion kept
+  (nearly) everything: `tt_rss_of_rows` at amplitudes × 1e-20 kept the
+  numerical ranks. `truncated_svd` (and `tt_rss`, `vec_to_mps`, the node SVD
+  splits) moves only where values lie between eps and eps·max(s): of 54400
+  calls of an option grid against `main`, 348 move, all on float32 matrices
+  whose largest singular value is below eps (1e-6, 1e-12), each now to the
+  rank of the same matrix at scale 1.
 - `svd=`: the SVD of each block that is not rank one, nothing else (a
   caller's fallbacks for failing SVDs). `generator=`: the draw at a split
   tie, the Q of a Gaussian QR with R's diagonal signs; `None` is torch's

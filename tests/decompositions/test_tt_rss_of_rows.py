@@ -423,6 +423,30 @@ def test_the_rank_of_a_cut_is_truncated_svds(options):
     assert tt_rss_of_rows(rows, amplitudes, [6, 6], **options)[0].shape[-1] == expected
 
 
+@pytest.mark.parametrize("options", [dict(rtol=0.01), dict(rtol=0.1), dict(cum_percentage=0.9),
+                                     dict(cum_percentage=0.99), dict(rtol=0.05, cum_percentage=0.9)])
+def test_the_rank_of_rtol_does_not_depend_on_the_scale(options):
+    """``rtol`` and ``cum_percentage`` keep the same ranks of A × 2⁻⁶⁰, A and A × 2⁶⁰
+    (the chain rows), and the same tensors up to that factor."""
+    rows, amplitudes = _amplitudes(_chain_rows())
+    chains = [tt_rss_of_rows(rows, amplitudes * c, [3] * 6, **options) for c in (2.0 ** -60, 1.0, 2.0 ** 60)]
+    assert _ranks(chains[0]) == _ranks(chains[1]) == _ranks(chains[2]) != [3, 8, 17, 6, 3]
+    for c, chain in zip((2.0 ** -60, 2.0 ** 60), (chains[0], chains[2])):
+        assert torch.allclose(_contracted(chain) / c, _contracted(chains[1]), rtol=1e-10, atol=1e-14)
+
+
+def test_cum_percentage_keeps_its_ranks_at_amplitudes_below_machine_epsilon():
+    """300 uniform rows of a chain of 8 (3 values) at cum_percentage 0.9: the ranks at
+    amplitudes × 1e-20 are those at × 1, not the numerical ranks (which an absolute clamp
+    of the singular values at eps gave)."""
+    x = torch.randint(0, 3, (300, 8), generator=torch.Generator().manual_seed(0))
+    rows, amplitudes = _amplitudes(x)
+    ranks = [_ranks(tt_rss_of_rows(rows, amplitudes * c, [3] * 8, cum_percentage=0.9)) for c in (1.0, 1e-20)]
+    numerical = _ranks(tt_rss_of_rows(rows, amplitudes, [3] * 8))
+    assert ranks[0] == ranks[1] == [3, 8, 22, 38, 22, 8, 3]
+    assert numerical != ranks[0]
+
+
 # MARK: svd
 
 def _blocks_not_rank_one(rows, n):
