@@ -457,14 +457,14 @@ def _truncation_rank(s: Tensor,
         final_rank = min(final_rank, max(1, atol_rank.item()))
     
     if rtol is not None:
-        # Each value at least eps times its row's largest, to avoid having all
-        # 0's: relative, so that the rank kept of s and of c * s is the same.
-        # An all-zero row is clamped at eps
+        # Each value divided by its row's largest, then at least eps, to avoid
+        # having all 0's: so that the rank kept of s and of c * s is the same,
+        # and squaring neither underflows nor overflows. An all-zero row has
+        # every value equal
         eps = torch.finfo(s.dtype).eps
-        floor = eps * s.amax(dim=-1, keepdim=True)
-        safe_s = torch.maximum(s, torch.where(floor > 0, floor,
-                                              torch.full_like(floor, eps)))
-        safe_s2 = safe_s.pow(2)
+        s_max = s.amax(dim=-1, keepdim=True)
+        ratios = torch.where(s_max > 0, s / s_max, torch.ones_like(s))
+        safe_s2 = torch.clamp(ratios, min=eps).pow(2)
         
         s2_sum = safe_s2.flip(dims=[-1]).cumsum(-1)
         s_ratios = s2_sum / (safe_s2.sum(-1, keepdim=True).expand(s.shape))

@@ -385,16 +385,20 @@ are in `docs/programs.md`.
   `cum_percentage`, each cut also capped by its numerical rank. The rule is
   `utils._truncation_rank`, which `truncated_svd` now calls too (and
   `_check_truncation` its checks), so the two cannot drift.
-- `rtol` / `cum_percentage` no longer depend on the scale (#12's review): the
-  singular values are clamped at eps times their row's largest, not at an
-  absolute eps (an all-zero row still at eps). The absolute clamp lifted every
-  value of a matrix whose largest is below eps to eps, so the criterion kept
-  (nearly) everything: `tt_rss_of_rows` at amplitudes × 1e-20 kept the
-  numerical ranks. `truncated_svd` (and `tt_rss`, `vec_to_mps`, the node SVD
-  splits) moves only where values lie between eps and eps·max(s): of 54400
-  calls of an option grid against `main`, 348 move, all on float32 matrices
-  whose largest singular value is below eps (1e-6, 1e-12), each now to the
-  rank of the same matrix at scale 1.
+- `rtol` / `cum_percentage` no longer depend on the scale (#12's review, two
+  rounds): the singular values are divided by their row's largest, then
+  clamped at eps, then squared (an all-zero row: every value equal, as
+  before). `main` clamped at an absolute eps: where max s is below about
+  eps·√(k / rtol), every small value was lifted to eps and the criterion kept
+  (nearly) everything (`tt_rss_of_rows` at amplitudes × 1e-20 kept the
+  numerical ranks); and its squares of unscaled values overflowed (float32
+  max s above about 1e19, float64 above 1e154: rank 1). The first fix, a clamp
+  at eps·max(s) before squaring, underflowed instead (float32 max s ≤ 1e-22,
+  float64 ≤ 1e-170: 0/0, rank 1), hence the division. On rank-2, rank-3 and graded
+  matrices at × 1e-30 … 1e20 (float32) and × 1e-200 … 1e160 (float64), every
+  `rank`/`rtol`/`cum_percentage` call (6600) now keeps `main`'s rank of the
+  same matrix at scale 1; 1088 of them move against `main`. A first version's
+  16000-call grid at unit-like scales gives the same bits as `main`.
 - `svd=`: the SVD of each block that is not rank one, nothing else (a
   caller's fallbacks for failing SVDs). `generator=`: the draw at a split
   tie, the Q of a Gaussian QR with R's diagonal signs; `None` is torch's
