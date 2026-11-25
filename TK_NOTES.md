@@ -368,3 +368,27 @@ are in `docs/programs.md`.
 - Still open: with `auto_stack`, `change_size` on a leaf node whose memory is
   in a stack (after a call, before `reset`) raises `TypeError` in
   `_save_in_network` (its address is `None`).
+
+## Since: issue #11, `tt_rss_of_rows` (2026-11-25)
+
+- `tk.decompositions.tt_rss_of_rows(rows, amplitudes, dims, rank)`: TT-RSS
+  of a tensor given on its support (zero elsewhere), with the rows as the
+  sketch samples. The sketch of a cut is then the unfolding over the rows'
+  distinct prefixes and suffixes, block diagonal over the connected
+  components of its entries, so no sketch is formed, nothing is queried, no
+  random unitary is drawn and no least-squares system is solved. Moved from
+  tpm-tn-benchmark (`tpm_tn/core/initialisers.py` at `4951c5b`); bit for bit
+  the same there on 236 calls (ranks 1 to 100, with and without
+  `cum_percentage`, split ties, two seeds each, SMILES's shape).
+- Its rank options are `tt_rss`'s and `truncated_svd`'s: `rank` (one cap,
+  one per bond, or `None`) and keyword-only `cutoff`, `atol`, `rtol`,
+  `cum_percentage`, each cut also capped by its numerical rank. The rule is
+  `utils._truncation_rank`, which `truncated_svd` now calls too (and
+  `_check_truncation` its checks), so the two cannot drift: `truncated_svd`
+  gives the same bits as before on 16000 calls (option grid, real, complex,
+  batched, zero).
+- `svd=`: the SVD of each block that is not rank one, nothing else (a
+  caller's fallbacks for failing SVDs). `generator=`: the draw at a split
+  tie, the Q of a Gaussian QR with R's diagonal signs; `None` is torch's
+  default generator.
+- `pyproject.toml` registers the `slow` marker (one test of the module).
