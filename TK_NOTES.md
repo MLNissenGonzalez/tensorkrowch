@@ -368,3 +368,39 @@ are in `docs/programs.md`.
 - Still open: with `auto_stack`, `change_size` on a leaf node whose memory is
   in a stack (after a call, before `reset`) raises `TypeError` in
   `_save_in_network` (its address is `None`).
+
+## Since: issue #11, `tt_rss_of_rows` (2026-11-25)
+
+- `tk.decompositions.tt_rss_of_rows(rows, amplitudes, dims, rank)`: TT-RSS
+  of a tensor given on its support (zero elsewhere), with the rows as the
+  sketch samples. The sketch of a cut is then the unfolding over the rows'
+  distinct prefixes and suffixes, block diagonal over the connected
+  components of its entries, so no sketch is formed, nothing is queried, no
+  random unitary is drawn and no least-squares system is solved. Moved from
+  tpm-tn-benchmark (`tpm_tn/core/initialisers.py` at `4951c5b`); bit for bit
+  the same there on 236 calls (ranks 1 to 100, with and without
+  `cum_percentage`, split ties, two seeds each, SMILES's shape).
+- Its rank options are `tt_rss`'s and `truncated_svd`'s: `rank` (one cap,
+  one per bond, or `None`) and keyword-only `cutoff`, `atol`, `rtol`,
+  `cum_percentage`, each cut also capped by its numerical rank. The rule is
+  `utils._truncation_rank`, which `truncated_svd` now calls too (and
+  `_check_truncation` its checks), so the two cannot drift.
+- `rtol` / `cum_percentage` no longer depend on the scale (#12's review, two
+  rounds): the singular values are divided by their row's largest, then
+  clamped at eps, then squared (an all-zero row: every value equal, as
+  before). `main` clamped at an absolute eps: where max s is below about
+  eps·√(k / rtol), every small value was lifted to eps and the criterion kept
+  (nearly) everything (`tt_rss_of_rows` at amplitudes × 1e-20 kept the
+  numerical ranks); and its squares of unscaled values overflowed (float32
+  max s above about 1e19, float64 above 1e154: rank 1). The first fix, a clamp
+  at eps·max(s) before squaring, underflowed instead (float32 max s ≤ 1e-22,
+  float64 ≤ 1e-170: 0/0, rank 1), hence the division. On rank-2, rank-3 and graded
+  matrices at × 1e-30 … 1e20 (float32) and × 1e-200 … 1e160 (float64), every
+  `rank`/`rtol`/`cum_percentage` call (6600) now keeps `main`'s rank of the
+  same matrix at scale 1; 1088 of them move against `main`. A first version's
+  16000-call grid at unit-like scales gives the same bits as `main`.
+- `svd=`: the SVD of each block that is not rank one, nothing else (a
+  caller's fallbacks for failing SVDs). `generator=`: the draw at a split
+  tie, the Q of a Gaussian QR with R's diagonal signs; `None` is torch's
+  default generator.
+- `pyproject.toml` registers the `slow` marker (one test of the module).

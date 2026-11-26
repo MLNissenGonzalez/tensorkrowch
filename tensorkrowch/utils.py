@@ -364,6 +364,11 @@ def truncated_svd(tensor: Tensor,
             \frac{\sum_{i \in \{kept\}}{s_i^2}}{\sum_{i \in \{all\}}{s_i^2}} \ge
             cum\_percentage
 
+        The rank ``rtol`` and ``cum_percentage`` keep of ``c * tensor`` is the
+        one they keep of ``tensor``, for any ``c > 0``: singular values below
+        ``eps`` times the largest count as that, ``eps`` the dtype's machine
+        epsilon.
+
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -382,6 +387,24 @@ def truncated_svd(tensor: Tensor,
     if rank is not None:
         if (not isinstance(rank, int)) or (rank < 1):
             raise ValueError('`rank` should be a positive integer')
+    _check_truncation(cutoff, atol, rtol, cum_percentage)
+    
+    u, s, vh = torch.linalg.svd(tensor, full_matrices=False)
+    final_rank = _truncation_rank(s, rank, cutoff, atol, rtol, cum_percentage)
+    
+    u = u[..., :final_rank]
+    s = s[..., :final_rank]
+    vh = vh[..., :final_rank, :]
+    
+    return u, s, vh
+
+
+def _check_truncation(cutoff: Optional[float],
+                      atol: Optional[float],
+                      rtol: Optional[float],
+                      cum_percentage: Optional[float]) -> None:
+    """Raises ``ValueError`` where one of :func:`truncated_svd`'s tolerances is
+    outside its range (``rank`` is checked by each caller, whose ranks differ)."""
     if cutoff is not None:
         if (not isinstance(cutoff, (int, float))) or (cutoff < 0):
             raise ValueError('`cutoff` should be a non-negative number')
@@ -395,14 +418,27 @@ def truncated_svd(tensor: Tensor,
         if ((not isinstance(cum_percentage, (int, float)))
             or (cum_percentage < 0) or (cum_percentage > 1)):
             raise ValueError('`cum_percentage` should be a number between 0 and 1')
-    
+
+
+def _truncation_rank(s: Tensor,
+                     rank: Optional[int],
+                     cutoff: Optional[float],
+                     atol: Optional[float],
+                     rtol: Optional[float],
+                     cum_percentage: Optional[float]) -> int:
+    """The rank :func:`truncated_svd` keeps of the singular values ``s``, of
+    shape ``(*, k)``, each row in descending order: the smallest of the ranks
+    the criteria given impose (each at least 1), at most ``k``; ``k`` with none.
+    One rank for every row: the largest that a criterion keeps in any row. The
+    one rule of the package's truncations (``truncated_svd``,
+    :func:`~tensorkrowch.decompositions.tt_rss_of_rows`), arguments already
+    checked (:func:`_check_truncation`)."""
     if cum_percentage is not None:
         if rtol is None:
             rtol = 1 - cum_percentage
         else:
             rtol = max(rtol, 1 - cum_percentage)
     
-    u, s, vh = torch.linalg.svd(tensor, full_matrices=False)
     final_rank = s.shape[-1]
     
     if rank is not None:
@@ -421,9 +457,14 @@ def truncated_svd(tensor: Tensor,
         final_rank = min(final_rank, max(1, atol_rank.item()))
     
     if rtol is not None:
+        # Each value divided by its row's largest, then at least eps, to avoid
+        # having all 0's: so that the rank kept of s and of c * s is the same,
+        # and squaring neither underflows nor overflows. An all-zero row has
+        # every value equal
         eps = torch.finfo(s.dtype).eps
-        safe_s = torch.clamp(s, min=eps) # To avoid having all 0's
-        safe_s2 = safe_s.pow(2)
+        s_max = s.amax(dim=-1, keepdim=True)
+        ratios = torch.where(s_max > 0, s / s_max, torch.ones_like(s))
+        safe_s2 = torch.clamp(ratios, min=eps).pow(2)
         
         s2_sum = safe_s2.flip(dims=[-1]).cumsum(-1)
         s_ratios = s2_sum / (safe_s2.sum(-1, keepdim=True).expand(s.shape))
@@ -431,8 +472,4 @@ def truncated_svd(tensor: Tensor,
         rtol_rank = torch.gt(s_ratios, rtol_tensor).view(-1, s.shape[-1]).any(dim=0).sum()
         final_rank = min(final_rank, max(1, rtol_rank.item()))
     
-    u = u[..., :final_rank]
-    s = s[..., :final_rank]
-    vh = vh[..., :final_rank, :]
-    
-    return u, s, vh
+    return final_rank

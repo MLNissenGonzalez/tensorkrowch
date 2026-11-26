@@ -7,6 +7,7 @@ This script contains:
     * create_projector
     * val_error
     * tt_rss
+    * tt_rss_of_rows
 """
 
 import time
@@ -18,7 +19,8 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 
 from tensorkrowch.embeddings import basis
-from tensorkrowch.utils import random_unitary, truncated_svd
+from tensorkrowch.utils import (random_unitary, truncated_svd,
+                                _check_truncation, _truncation_rank)
 import tensorkrowch.models as models
 
 
@@ -823,3 +825,311 @@ def tt_rss(function: Callable,
         return cores, info
             
     return cores
+
+
+
+# The tolerance of a tie at a cut of ``tt_rss_of_rows``: singular values within this fraction
+# of the cut's largest are equal. Distinct rows give whole groups of exactly equal ones (a row
+# seen once, alone in its block, gives √(1 / N)), which rounding leaves within about 1e-15 of
+# each other; 1e-10 is far above that, and far below the gap between unequal counts.
+TIE_TOLERANCE = 1e-10
+
+
+def tt_rss_of_rows(rows: torch.Tensor,
+                   amplitudes: torch.Tensor,
+                   dims: Sequence[int],
+                   rank: Optional[Union[int, Sequence[int]]] = None,
+                   *,
+                   cutoff: Optional[float] = None,
+                   atol: Optional[float] = None,
+                   rtol: Optional[float] = None,
+                   cum_percentage: Optional[float] = None,
+                   svd: Callable = torch.linalg.svd,
+                   generator: Optional[torch.Generator] = None) -> List[torch.Tensor]:
+    r"""
+    TT-RSS, tensor train via recursive sketching from samples (Hur, Hoskins,
+    Lindsey and Khoo, `arXiv:2202.11788 <https://arxiv.org/abs/2202.11788>`_),
+    of a tensor given on its support: the tensor :math:`A` on :math:`n`
+    variables that is ``amplitudes[j]`` at the configuration ``rows[j]`` and 0
+    elsewhere, with the rows themselves the sketch samples. It is
+    :func:`tt_rss` on :math:`A` as a function, without ever forming a sketch:
+    memory grows with the distinct rows times the rank, where :func:`tt_rss`'s
+    sketches are (distinct prefixes) × :math:`d_k` × (distinct suffixes) per cut.
+    No query is made, no random unitary is drawn and no least-squares system is
+    solved.
+
+    **The cut after variable** :math:`k`. Every entry of a sketch off
+    :math:`A`'s support is 0, so the sketch of the cut is, up to rows and
+    columns of zeros, the unfolding
+
+    .. math::
+
+        C_k[x_{\le k}, x_{>k}] = A(x) \quad \text{one entry per distinct row},
+
+    over the rows' distinct prefixes and suffixes. :math:`U_k`, its kept left
+    singular vectors (over the prefixes), is the cut's factor. :math:`C_k` is
+    block diagonal over the connected components of its entries (a row joins
+    its prefix to its suffix), so its SVD is the union of the blocks' (``svd``;
+    a block with one prefix or one suffix has rank one, its norm the singular
+    value): :math:`C_k` is never formed whole, and a block of :math:`b`
+    entries, connected, has at most :math:`b + 1` prefixes and suffixes
+    together, so it holds at most :math:`((b + 1) / 2)^2` numbers.
+
+    **The tensors.** The left sketch of a cut is :math:`U_{k-1}`, whose columns
+    are orthonormal, so TT-RSS's least-squares solve is a transpose:
+
+    .. math::
+
+        G_k[a, v, b] = \sum_{s} U_{k-1}[s \setminus v, a] \, U_k[s, b],
+
+    the sum over the prefixes :math:`s` of length :math:`k + 1` ending in
+    :math:`v`; :math:`G_0 = U_0`, by value, and the last
+    :math:`G[a, v] = \sum_{j:\, x_{n-1} = v} U_{n-2}[\text{prefix of } j, a]
+    \, A(\text{rows}[j])`.
+
+    **The rank of cut** :math:`k`. At most :math:`C_k`'s numerical rank (the
+    singular values above :math:`\sigma_{\max} \cdot m \cdot \epsilon`, with
+    :math:`m` its larger side: within a block, a value at rounding level), and
+    at most what ``rank``, ``cutoff``, ``atol``, ``rtol`` and
+    ``cum_percentage`` keep, by :func:`~tensorkrowch.utils.truncated_svd`'s
+    rule, applied to the cut's singular values sorted over all its blocks: the
+    most restrictive criterion wins, and the rank is at least 1. It is then at
+    most :math:`r_{k-1} d_k`, :func:`tt_rss`'s other cap, without one:
+    :math:`C_k`'s columns lie in :math:`\mathrm{range}(C_{k-1}) \otimes
+    \mathbb{R}^{d_k}`, and :math:`U_{k-1} \otimes I`, of :math:`r_{k-1} d_k`
+    columns, keeps as much of :math:`C_k` as :math:`U_{k-1}` kept of
+    :math:`C_{k-1}`. With no criterion given every cut keeps its numerical
+    rank, and the chain is :math:`A` up to rounding.
+
+    **Ties.** Where the rank falls inside a group of equal singular values
+    (within ``TIE_TOLERANCE`` = 1e-10 of the cut's largest), as it does on
+    distinct rows, the vectors above the group are kept, and the rest is a
+    uniformly random subspace of the group's span (the Q of the QR of a
+    Gaussian matrix drawn from ``generator``, its columns multiplied by the
+    signs of R's diagonal), the draw assigned to the group's vectors in the
+    order of their blocks, not of their values, which rounding sets: the same
+    seed gives the same chain when the amplitudes move by rounding. Every such
+    subspace is as good by Frobenius norm, and the chain then depends on the
+    seed; without a split group nothing is drawn. Vectors are never taken by
+    their order, which can keep blocks that miss the data. :func:`tt_rss`'s
+    random unitary chooses within the group too, in a distribution close to
+    this one but not the same (LAPACK's basis of the rotated sketch). Within one
+    block whose singular values repeat, the basis is the SVD's, which rounding
+    sets.
+
+    **Memory**: the blocks, and per cut the prefixes' factor, prefixes ×
+    :math:`r`; the tensors are one product per value,
+    :math:`U_{k-1}^T U_k` over the prefixes ending in it.
+
+    Parameters
+    ----------
+    rows : torch.Tensor
+        Integer tensor of shape ``(M, n)``: the configurations where the tensor
+        is given, variable ``i`` taking the values ``0 .. dims[i] - 1``.
+    amplitudes : torch.Tensor
+        Real tensor of shape ``(M,)``: the tensor's entry at each row. Repeated
+        rows add.
+    dims : list[int] or tuple[int]
+        The number of values of each variable, ``n`` of them.
+    rank : int, list[int] or tuple[int], optional
+        The largest rank of every bond (an int), or of each bond (a sequence of
+        ``n - 1``). ``None``: no cap.
+    cutoff : float, optional
+        As in :func:`~tensorkrowch.utils.truncated_svd`. It must be
+        non-negative.
+    atol : float, optional
+        As in :func:`~tensorkrowch.utils.truncated_svd`. It must be
+        non-negative.
+    rtol : float, optional
+        As in :func:`~tensorkrowch.utils.truncated_svd`. It must be in
+        ``[0, 1]``.
+    cum_percentage : float, optional
+        As in :func:`~tensorkrowch.utils.truncated_svd`, a share of all of the
+        cut's squared singular values (:math:`\sum A^2`): equivalent to
+        ``rtol = 1 - cum_percentage``. It must be in ``[0, 1]``.
+    svd : Callable
+        Called as ``svd(matrix, full_matrices=False)``, it returns ``(U, S, Vh)``
+        as :func:`torch.linalg.svd` does, which is the default. It is used for
+        the SVD of every block that is not rank one, and for nothing else: a
+        caller with its own fallbacks for failing SVDs passes them here.
+    generator : torch.Generator, optional
+        The generator of the random subspaces drawn where a cut splits a group
+        of tied singular values. ``None``: torch's default generator.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        The ``n`` tensors of the chain, in float64 on the CPU, legs (left,
+        value, right): ``(d_0, r_0)`` first, ``(r_{n-2}, d_{n-1})`` last, and
+        ``(d_0,)`` for ``n = 1``, as :func:`tt_rss` returns them.
+
+    Raises
+    ------
+    ValueError
+        If ``rows`` is not ``(M, n)`` integers within ``dims``, ``amplitudes``
+        is not a real vector of one entry per row or is zero on every row,
+        ``rank`` (or an entry of it) is below 1, a ``rank`` sequence does not
+        have ``n - 1`` entries, or ``cutoff``, ``atol``, ``rtol`` or
+        ``cum_percentage`` is outside its range.
+
+    Examples
+    --------
+    >>> rows = torch.tensor([[0, 0, 1], [1, 1, 0], [2, 1, 1]])
+    >>> amplitudes = torch.tensor([0.5, -1.0, 2.0], dtype=torch.float64)
+    >>> tensors = tk.decompositions.tt_rss_of_rows(rows, amplitudes,
+    ...                                            dims=[3, 2, 2], rank=2)
+    >>> [t.shape for t in tensors]
+    [torch.Size([3, 2]), torch.Size([2, 2, 2]), torch.Size([2, 2])]
+    """
+    dims = [int(d) for d in dims]
+    if rows.dim() != 2 or rows.is_floating_point() or rows.is_complex() or rows.shape[1] != len(dims) \
+            or len(dims) == 0:
+        raise ValueError(f"rows must be (M, n) integers, n = len(dims) = {len(dims)} > 0; got {rows.dtype}, "
+                         f"shape {tuple(rows.shape)}")
+    if amplitudes.shape != (len(rows),) or amplitudes.is_complex():
+        raise ValueError(f"amplitudes must be a real vector of one entry per row ({len(rows)}); got "
+                         f"{amplitudes.dtype}, shape {tuple(amplitudes.shape)}")
+    n = len(dims)
+    ranks = list(rank) if isinstance(rank, Sequence) else [rank] * (n - 1)
+    if len(ranks) != n - 1:
+        raise ValueError(f"rank must be an int or a sequence of n - 1 = {n - 1} ints, one per bond; got "
+                         f"{len(ranks)}")
+    if rank is not None and any(not isinstance(r, int) or r < 1 for r in ranks):
+        raise ValueError(f"rank must be an int >= 1 (one, or one per bond), got {rank}")
+    _check_truncation(cutoff, atol, rtol, cum_percentage)
+    options = dict(cutoff=cutoff, atol=atol, rtol=rtol, cum_percentage=cum_percentage)
+    rows = rows.cpu().long()
+    if bool(((rows < 0) | (rows >= torch.tensor(dims))).any()):
+        raise ValueError(f"rows hold a value outside 0 .. dims[i] - 1, dims {tuple(dims)}")
+    rows, inverse = torch.unique(rows, dim=0, return_inverse=True)
+    values = torch.zeros(len(rows), dtype=torch.float64).index_add_(0, inverse, amplitudes.cpu().to(torch.float64))
+    rows, values = rows[values != 0], values[values != 0]
+    if len(rows) == 0:
+        raise ValueError("amplitudes are zero on every row: the tensor is zero")
+    if n == 1:
+        return [torch.zeros(dims[0], dtype=torch.float64).index_add_(0, rows[:, 0], values)]
+    prefixes = _prefix_ids(rows)  # [k][j]: the index of row j's x_{<=k} among the distinct ones
+    suffixes = _prefix_ids(rows.flip(1))[::-1][1:]  # [k][j]: of its x_{>k}
+    tensors, previous = [], None
+    for k in range(n - 1):
+        factor = _cut_factor(prefixes[k], suffixes[k], values, ranks[k], options, svd, generator)
+        value = _by_id(prefixes[k], rows[:, k])
+        if previous is None:
+            tensors.append(torch.zeros(dims[0], factor.shape[1], dtype=torch.float64).index_add_(0, value, factor))
+        else:  # one product per value v, over the prefixes ending in v: memory ∝ prefixes · r
+            parent = _by_id(prefixes[k], prefixes[k - 1])
+            node = torch.zeros(previous.shape[1], dims[k], factor.shape[1], dtype=torch.float64)
+            for v in torch.unique(value).tolist():
+                ending = value == v
+                node[:, v] = previous[parent[ending]].T @ factor[ending]
+            tensors.append(node)
+        previous = factor
+    last = previous[prefixes[n - 2]] * values[:, None]
+    tensors.append(torch.zeros(dims[n - 1], previous.shape[1], dtype=torch.float64).index_add_(0, rows[:, n - 1],
+                                                                                              last).T)
+    return tensors
+
+
+def _prefix_ids(rows: torch.Tensor) -> List[torch.Tensor]:
+    """For k = 0 .. n − 1, the index of each row's prefix x_{<=k} among the distinct ones:
+    ``torch.unique`` of (x_{<k}'s index, x_k)."""
+    ids, out = torch.zeros(len(rows), dtype=torch.long), []
+    for k in range(rows.shape[1]):
+        ids = torch.unique(torch.stack([ids, rows[:, k]], dim=1), dim=0, return_inverse=True)[1]
+        out.append(ids)
+    return out
+
+
+def _by_id(ids: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """``values`` indexed by ``ids`` (0 .. max): the value of each id's rows, which share it."""
+    out = torch.empty(int(ids.max()) + 1, dtype=values.dtype)
+    out[ids] = values
+    return out
+
+
+def _cut_factor(prefix: torch.Tensor, suffix: torch.Tensor, values: torch.Tensor, rank: Optional[int],
+                options: dict, svd: Callable, generator: Optional[torch.Generator]) -> torch.Tensor:
+    """U, the kept left singular vectors over the prefixes of the matrix with ``values[j]``
+    at (``prefix[j]``, ``suffix[j]``), each pair once, from its blocks, the connected
+    components of its entries (``tt_rss_of_rows``: the rank, at most ``rank`` and what
+    ``options``, truncated_svd's tolerances, keep, and ties)."""
+    n_prefixes, n_suffixes = int(prefix.max()) + 1, int(suffix.max()) + 1
+    block = _components(prefix, suffix + n_prefixes, n_prefixes + n_suffixes)
+    n_blocks = int(block.max()) + 1
+    one_suffix = torch.bincount(_by_id(suffix, block), minlength=n_blocks) == 1
+    one_prefix = torch.bincount(_by_id(prefix, block), minlength=n_blocks) == 1
+    rank_one = one_prefix | one_suffix
+    norms = torch.zeros(n_blocks, dtype=torch.float64).index_add_(0, block, values ** 2).sqrt()
+    # A rank-one block's vector is Σ_j w_j e_{prefix j} over its entries: w_j = values[j] / norm
+    # where it has one suffix (each prefix once), else (one prefix) 1 on its first entry.
+    weights = torch.where(one_suffix[block], values / norms[block], torch.zeros_like(values))
+    first = torch.full((n_blocks,), len(block), dtype=torch.long).scatter_reduce_(
+        0, block, torch.arange(len(block)), "amin")
+    weights[first[one_prefix & ~one_suffix]] = 1.0
+    # The candidates, one per singular value: the rank-one blocks' (in block order), then each
+    # other block's, from ``offset`` on. ``mixing`` maps them to the kept columns.
+    sigmas, dense, offset = [norms[rank_one]], [], int(rank_one.sum())
+    order = torch.argsort(block, stable=True)
+    for entries in torch.split(order, torch.bincount(block, minlength=n_blocks).tolist()):
+        if bool(rank_one[block[entries[0]]]):
+            continue
+        local, p = torch.unique(prefix[entries], return_inverse=True)
+        s = torch.unique(suffix[entries], return_inverse=True)[1]
+        matrix = torch.zeros(len(local), int(s.max()) + 1, dtype=torch.float64)
+        matrix[p, s] = values[entries]
+        u, sigma, _ = svd(matrix, full_matrices=False)
+        dense.append((local, u, offset))
+        sigmas.append(sigma)
+        offset += len(sigma)
+    sigmas, order = torch.sort(torch.cat(sigmas), descending=True, stable=True)
+    numerical = _numerical_rank(sigmas, max(n_prefixes, n_suffixes))
+    r = max(1, min(numerical, _truncation_rank(sigmas, rank, **options)))
+    tied = ((sigmas[:numerical] - sigmas[r - 1]).abs() <= TIE_TOLERANCE * sigmas[0]).nonzero().flatten()
+    above = int(tied[0]) if int(tied[-1]) >= r else r  # whether the cut splits the group
+    mixing = torch.zeros(len(order), r, dtype=torch.float64)
+    mixing[order[:above], torch.arange(above)] = 1.0
+    if above < r:
+        # by the candidates' index, not the values' order, which rounding sets within the group
+        mixing[order[tied].sort().values, above:] = _haar_isometry(len(tied), r - above, generator)
+    factor = torch.zeros(n_prefixes, r, dtype=torch.float64)
+    entries = (rank_one[block] & (weights != 0)).nonzero().flatten()
+    factor.index_add_(0, prefix[entries], weights[entries, None] * mixing[(rank_one.cumsum(0) - 1)[block[entries]]])
+    for local, u, offset in dense:
+        factor[local] += u @ mixing[offset:offset + u.shape[1]]
+    return factor
+
+
+def _components(a: torch.Tensor, b: torch.Tensor, n: int) -> torch.Tensor:
+    """The connected component of each edge (a[j], b[j]) of a graph on n vertices, numbered
+    0 .. C − 1 (union-find with path halving)."""
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, j in zip(a.tolist(), b.tolist()):
+        i, j = find(i), find(j)
+        if i != j:
+            parent[max(i, j)] = min(i, j)
+    return torch.unique(torch.tensor([find(i) for i in a.tolist()]), return_inverse=True)[1]
+
+
+def _numerical_rank(values: torch.Tensor, size: int) -> int:
+    """How many of ``values`` (the singular values of a matrix whose larger side is
+    ``size``) exceed max(values) · size · ε, ε the machine epsilon of their dtype: those that
+    rounding of an SVD cannot set (its backward error is of order size · ε · ‖M‖). 0 for no
+    values, or none above 0."""
+    if values.numel() == 0:
+        return 0
+    return int((values > values.max() * size * torch.finfo(values.dtype).eps).sum())
+
+
+def _haar_isometry(m: int, k: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+    """An (m, k) float64 matrix Q with QᵀQ = I, Haar distributed (k <= m): the Q of the QR of
+    a Gaussian matrix drawn from ``generator``, its columns multiplied by the signs of R's
+    diagonal (1 where it is 0)."""
+    q, r = torch.linalg.qr(torch.randn(m, k, dtype=torch.float64, generator=generator))
+    return q * torch.where(r.diagonal() < 0, -1.0, 1.0).to(torch.float64)

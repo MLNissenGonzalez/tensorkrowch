@@ -14,3 +14,7 @@ mat_to_mpo
 tt_rss
 ^^^^^^
 .. autofunction:: tt_rss
+
+tt_rss_of_rows
+^^^^^^^^^^^^^^
+.. autofunction:: tt_rss_of_rows
